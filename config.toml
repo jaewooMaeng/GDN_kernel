@@ -1,8 +1,25 @@
+# ============================================================
+# Decode kernel — uncomment below and comment out prefill
+# ============================================================
+# [solution]
+# name = "gdn-decode-cuda-v1"
+# definition = "gdn_decode_qk4_v8_d128_k_last"
+# author = "MSInfer"
+#
+# [build]
+# language = "cuda"
+# entry_point = "kernel.cu::kernel"
+# files = ["kernel.cu"]
+
+# ============================================================
+# Prefill kernel (default)
+# ============================================================
 [solution]
-name = "my-team-solution-v1"      # Solution name
-definition = "fused_moe"          # Track: fused_moe | sparse_attention | gated_delta_net
-author = "team-name"              # Team/author name
+name = "gdn-prefill-cuda-v1"
+definition = "gdn_prefill_qk4_v8_d128_k_last"
+author = "MSInfer"
 
 [build]
-language = "triton"               # triton | cuda
-entry_point = "kernel"            # Kernel function name
+language = "cuda"
+entry_point = "kernel_prefill.cu::kernel"
+files = ["kernel_prefill.cu"]
