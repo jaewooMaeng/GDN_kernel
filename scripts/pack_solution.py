@@ -6,6 +6,8 @@ Reads configuration from config.toml and packs the appropriate source files
 """
 
 import sys
+import shutil
+import tempfile
 from pathlib import Path
 
 # Add project root to path for imports
@@ -41,7 +43,6 @@ def pack_solution(output_path: Path = None) -> Path:
     language = build_config["language"]
     entry_point = build_config["entry_point"]
 
-    # Determine source directory based on language
     if language == "triton":
         source_dir = PROJECT_ROOT / "solution" / "triton"
     elif language == "cuda":
@@ -54,21 +55,42 @@ def pack_solution(output_path: Path = None) -> Path:
 
     # Create build spec
     dps = build_config.get("destination_passing_style", True)
-    spec = BuildSpec(
+    binding = build_config.get("binding", None)
+    spec_kwargs = dict(
         language=language,
         target_hardware=["cuda"],
         entry_point=entry_point,
         destination_passing_style=dps,
     )
+    if binding:
+        spec_kwargs["binding"] = binding
+    spec = BuildSpec(**spec_kwargs)
 
-    # Pack the solution
-    solution = pack_solution_from_files(
-        path=str(source_dir),
-        spec=spec,
-        name=solution_config["name"],
-        definition=solution_config["definition"],
-        author=solution_config["author"],
-    )
+    # If 'files' is specified, copy only those files to a temp directory for packing
+    file_list = build_config.get("files", None)
+    pack_dir = source_dir
+
+    tmp_dir_obj = None
+    if file_list:
+        tmp_dir_obj = tempfile.TemporaryDirectory()
+        pack_dir = Path(tmp_dir_obj.name)
+        for fname in file_list:
+            src = source_dir / fname
+            if not src.exists():
+                raise FileNotFoundError(f"Source file not found: {src}")
+            shutil.copy2(src, pack_dir / fname)
+
+    try:
+        solution = pack_solution_from_files(
+            path=str(pack_dir),
+            spec=spec,
+            name=solution_config["name"],
+            definition=solution_config["definition"],
+            author=solution_config["author"],
+        )
+    finally:
+        if tmp_dir_obj:
+            tmp_dir_obj.cleanup()
 
     # Write to output file
     if output_path is None:

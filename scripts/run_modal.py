@@ -26,14 +26,19 @@ trace_volume = modal.Volume.from_name("flashinfer-trace", create_if_missing=True
 TRACE_SET_PATH = "/data"
 
 image = (
-    modal.Image.debian_slim(python_version="3.12")
+    modal.Image.from_registry("nvidia/cuda:12.8.1-devel-ubuntu22.04", add_python="3.12")
+    .apt_install("build-essential", "ninja-build")
     .pip_install("flashinfer-bench", "torch", "triton", "numpy")
+    .env({"CUDA_HOME": "/usr/local/cuda"})
 )
 
 
 @app.function(image=image, gpu="B200:1", timeout=3600, volumes={TRACE_SET_PATH: trace_volume})
-def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
+def run_benchmark(solution: Solution, config: BenchmarkConfig = None, max_workloads: int = 0) -> dict:
     """Run benchmark on Modal B200 and return results."""
+    import sys
+    sys.stdout.reconfigure(line_buffering=True)
+
     if config is None:
         config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
 
@@ -47,6 +52,10 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
 
     if not workloads:
         raise ValueError(f"No workloads found for definition '{solution.definition}'")
+
+    if max_workloads > 0:
+        workloads = workloads[:max_workloads]
+    print(f"Running {len(workloads)} workload(s), config: warmup={config.warmup_runs}, iter={config.iterations}, trials={config.num_trials}", flush=True)
 
     bench_trace_set = TraceSet(
         root=trace_set.root,
@@ -75,6 +84,8 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
             if trace.evaluation.correctness:
                 entry["max_abs_error"] = trace.evaluation.correctness.max_absolute_error
                 entry["max_rel_error"] = trace.evaluation.correctness.max_relative_error
+            if trace.evaluation.log:
+                entry["log"] = trace.evaluation.log
             results[definition.name][trace.workload.uuid] = entry
 
     return results
@@ -101,6 +112,12 @@ def print_results(results: dict):
 
             print()
 
+            if result.get("log") and status != "PASSED":
+                log_text = result["log"]
+                if len(log_text) > 2000:
+                    log_text = log_text[-2000:]
+                print(f"    Log: {log_text}")
+
 
 @app.local_entrypoint()
 def main():
@@ -114,8 +131,9 @@ def main():
     solution = Solution.model_validate_json(solution_path.read_text())
     print(f"Loaded: {solution.name} ({solution.definition})")
 
-    print("\nRunning benchmark on Modal B200...")
-    results = run_benchmark.remote(solution)
+    config = BenchmarkConfig(warmup_runs=1, iterations=10, num_trials=1)
+    print("\nRunning benchmark on Modal B200 (all workloads, 10 iters)...")
+    results = run_benchmark.remote(solution, config=config, max_workloads=0)
 
     if not results:
         print("No results returned!")
