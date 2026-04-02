@@ -7,28 +7,34 @@
 
 static constexpr int K_DIM = 128;
 static constexpr int V_DIM = 128;
+static constexpr int K_PAD = K_DIM + 1; // 129, for bank-conflict-free S reads
 static constexpr int NUM_Q_HEADS = 4;
 static constexpr int NUM_V_HEADS = 8;
 static constexpr int GQA_RATIO = NUM_V_HEADS / NUM_Q_HEADS;
 static constexpr int CHUNK = 64;
 static constexpr int NTHREADS = 128;
-static constexpr int NWARPS = NTHREADS / 32;
 
-__device__ __forceinline__ float warp_reduce_sum(float val) {
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
-        val += __shfl_xor_sync(0xffffffff, val, offset);
-    return val;
-}
-
-// Shared memory: T_mat[C*C] + QK[C*C] + K_c[C*K] + buf_D[C*K] + gamma[C] + beta[C]
-//              + v_new[C] + exp_gamma[C] + xwarp[4*C*2] + inter[C] + corr[C]
-static constexpr int SMEM_FLOATS =
-    2*CHUNK*CHUNK + 2*CHUNK*K_DIM + CHUNK*4 + 4*CHUNK*2 + 2*CHUNK;
-static constexpr int SMEM_BYTES = SMEM_FLOATS * sizeof(float);
+// Shared memory layout (~225KB total, within B200's 228KB)
+// Fixed: T_mat[C*C] + QK[C*C] + gamma[C] + beta[C] + exp_gamma[C]
+// Variable (time-multiplexed):
+//   Phase1: K_c[C*K] + buf_D[C*K]
+//   Phase2: S_smem[V*K_PAD] + w_decay[C*K] + Q_exp[C*K] + inter[C*V] + corr[C*V]
+static constexpr int OFF_TMAT = 0;
+static constexpr int OFF_QKMAT = CHUNK * CHUNK * 4;
+static constexpr int OFF_GAMMA = OFF_QKMAT + CHUNK * CHUNK * 4;
+static constexpr int OFF_BETA  = OFF_GAMMA + CHUNK * 4;
+static constexpr int OFF_EXPG  = OFF_BETA + CHUNK * 4;
+static constexpr int OFF_VAR   = OFF_EXPG + CHUNK * 4;
+// Phase 2 variable offsets
+static constexpr int OFF_SSMEM  = OFF_VAR;
+static constexpr int OFF_WDEC2  = OFF_SSMEM + V_DIM * K_PAD * 4;
+static constexpr int OFF_QEXP   = OFF_WDEC2 + CHUNK * K_DIM * 4;
+static constexpr int OFF_INTER  = OFF_QEXP + CHUNK * K_DIM * 4;
+static constexpr int OFF_CORR   = OFF_INTER + CHUNK * V_DIM * 4;
+static constexpr int SMEM_BYTES = OFF_CORR + CHUNK * V_DIM * 4;
 
 __global__ __launch_bounds__(NTHREADS)
-void gdn_prefill_chunk_kernel(
+void gdn_prefill_phase4_kernel(
     const __nv_bfloat16* __restrict__ q,
     const __nv_bfloat16* __restrict__ k,
     const __nv_bfloat16* __restrict__ v,
@@ -45,8 +51,6 @@ void gdn_prefill_chunk_kernel(
     const int seq_idx  = blockIdx.x;
     const int head_idx = blockIdx.y;
     const int tid      = threadIdx.x;
-    const int warp_id  = tid >> 5;
-    const int lane_id  = tid & 31;
     const int qk_head  = head_idx / GQA_RATIO;
 
     const int seq_start = static_cast<int>(cu_seqlens[seq_idx]);
@@ -68,18 +72,23 @@ void gdn_prefill_chunk_kernel(
     const float A_val  = __ldg(&A_log[head_idx]);
     const float dt_val = __ldg(&dt_bias[head_idx]);
 
-    extern __shared__ float smem[];
-    float* T_mat      = smem;
-    float* QK_mat     = T_mat + CHUNK * CHUNK;
-    float* K_c        = QK_mat + CHUNK * CHUNK;
-    float* buf_D      = K_c + CHUNK * K_DIM;
-    float* gamma_s    = buf_D + CHUNK * K_DIM;
-    float* beta_s     = gamma_s + CHUNK;
-    float* v_new_buf  = beta_s + CHUNK;
-    float* exp_gamma  = v_new_buf + CHUNK;
-    float* xwarp_buf  = exp_gamma + CHUNK;
-    float* inter_buf  = xwarp_buf + 4 * CHUNK * 2;
-    float* corr_buf   = inter_buf + CHUNK;
+    extern __shared__ char smem[];
+    float* T_mat     = reinterpret_cast<float*>(smem + OFF_TMAT);
+    float* QK_mat    = reinterpret_cast<float*>(smem + OFF_QKMAT);
+    float* gamma_s   = reinterpret_cast<float*>(smem + OFF_GAMMA);
+    float* beta_s    = reinterpret_cast<float*>(smem + OFF_BETA);
+    float* exp_gamma = reinterpret_cast<float*>(smem + OFF_EXPG);
+
+    // Phase 1 pointers (variable region)
+    float* K_c   = reinterpret_cast<float*>(smem + OFF_VAR);
+    float* buf_D = reinterpret_cast<float*>(smem + OFF_VAR + CHUNK * K_DIM * 4);
+
+    // Phase 2 pointers
+    float* S_smem    = reinterpret_cast<float*>(smem + OFF_SSMEM);
+    float* w_decay2  = reinterpret_cast<float*>(smem + OFF_WDEC2);
+    float* Q_exp_s   = reinterpret_cast<float*>(smem + OFF_QEXP);
+    float* inter_mat = reinterpret_cast<float*>(smem + OFF_INTER);
+    float* corr_mat  = reinterpret_cast<float*>(smem + OFF_CORR);
 
     const int num_chunks = (seq_len + CHUNK - 1) / CHUNK;
 
@@ -87,7 +96,9 @@ void gdn_prefill_chunk_kernel(
         const int cstart = seq_start + chunk * CHUNK;
         const int clen   = min(CHUNK, seq_end - cstart);
 
-        // ===== 1. Gates =====
+        // ========== PHASE 1: A matrix, forward sub, QK, w_decay ==========
+
+        // 1. Gates
         if (tid < CHUNK) {
             if (tid < clen) {
                 int pos = cstart + tid;
@@ -104,17 +115,14 @@ void gdn_prefill_chunk_kernel(
         }
         __syncthreads();
 
-        // ===== 2. Prefix sum gamma =====
+        // 2. Prefix sum gamma + exp_gamma
         if (tid == 0)
             for (int i = 1; i < CHUNK; i++) gamma_s[i] += gamma_s[i - 1];
         __syncthreads();
-
-        // ===== 2b. Precompute exp(gamma[c]) =====
-        if (tid < CHUNK)
-            exp_gamma[tid] = expf(gamma_s[tid]);
+        if (tid < CHUNK) exp_gamma[tid] = expf(gamma_s[tid]);
         __syncthreads();
 
-        // ===== 3. Load K_c =====
+        // 3. Load K_c
         for (int c = 0; c < CHUNK; c++) {
             float kv = 0.0f;
             if (c < clen)
@@ -123,7 +131,7 @@ void gdn_prefill_chunk_kernel(
         }
         __syncthreads();
 
-        // ===== 4. A matrix (parallel dot products) =====
+        // 4. A matrix
         for (int idx = tid; idx < CHUNK * CHUNK; idx += NTHREADS) {
             int i = idx / CHUNK, j = idx % CHUNK;
             float val = 0.0f;
@@ -137,7 +145,7 @@ void gdn_prefill_chunk_kernel(
         }
         __syncthreads();
 
-        // ===== 5. Forward substitution =====
+        // 5. Forward substitution
         for (int i = 1; i < clen; i++) {
             float nv = 0.0f;
             bool act = tid < i;
@@ -154,20 +162,15 @@ void gdn_prefill_chunk_kernel(
         if (tid < CHUNK) T_mat[tid * CHUNK + tid] = 1.0f;
         __syncthreads();
 
-        // ===== 6. Load Q and precompute Q_exp =====
-        float Q_local[CHUNK];
-        float Q_exp[CHUNK];
+        // 6. Load Q to buf_D, compute QK
         for (int c = 0; c < CHUNK; c++) {
             float qv = 0.0f;
             if (c < clen)
                 qv = __bfloat162float(__ldg(&q[(cstart + c) * NUM_Q_HEADS * K_DIM + qk_head * K_DIM + tid]));
-            Q_local[c] = qv;
             buf_D[c * K_DIM + tid] = qv;
-            Q_exp[c] = qv * exp_gamma[c];
         }
         __syncthreads();
 
-        // ===== 7. QK_masked =====
         for (int idx = tid; idx < CHUNK * CHUNK; idx += NTHREADS) {
             int i = idx / CHUNK, j = idx % CHUNK;
             float val = 0.0f;
@@ -181,7 +184,7 @@ void gdn_prefill_chunk_kernel(
         }
         __syncthreads();
 
-        // ===== 8. w_decay (using precomputed exp_gamma) =====
+        // 7. w_decay = T̃ @ (K*beta*exp_gamma) into buf_D
         for (int c = 0; c < CHUNK; c++) {
             float acc = 0.0f;
             int lim = min(c + 1, clen);
@@ -191,76 +194,103 @@ void gdn_prefill_chunk_kernel(
         }
         __syncthreads();
 
-        // ===== 9. Precompute K_decay and decay_total =====
+        // 8. Precompute K_decay in registers
         float gamma_last = gamma_s[clen - 1];
         float decay_total = expf(gamma_last);
         float K_decay[CHUNK];
         for (int c = 0; c < CHUNK; c++)
             K_decay[c] = K_c[c * K_DIM + tid] * expf(gamma_last - gamma_s[c]);
 
-        // ===== 10. Per-vi loop =====
-        for (int vi = 0; vi < V_DIM; vi++) {
-            float s_val = S[vi];
+        // 9. Copy w_decay to safe location before S_smem overwrites buf_D
+        for (int c = 0; c < CHUNK; c++)
+            w_decay2[c * K_DIM + tid] = buf_D[c * K_DIM + tid];
+        __syncthreads();
 
-            // Load v_beta
-            if (tid < clen) {
-                int pos = cstart + tid;
-                float vv = __bfloat162float(__ldg(&v[pos * NUM_V_HEADS * V_DIM + head_idx * V_DIM + vi]));
-                v_new_buf[tid] = beta_s[tid] * vv;
-            }
-            __syncthreads();
+        // ========== PHASE 2: Batch inter/corr, u, intra, output, state ==========
 
-            // Batched cross-warp reduction for inter and corr
-            for (int c = 0; c < clen; c++) {
-                float p_int = warp_reduce_sum(Q_exp[c] * s_val);
-                float p_cor = warp_reduce_sum(buf_D[c * K_DIM + tid] * s_val);
-                if (lane_id == 0) {
-                    xwarp_buf[warp_id * CHUNK * 2 + c * 2]     = p_int;
-                    xwarp_buf[warp_id * CHUNK * 2 + c * 2 + 1] = p_cor;
-                }
-            }
-            __syncthreads();
+        // 10. Write S to S_smem (padded stride K_PAD=129)
+        for (int vi = 0; vi < V_DIM; vi++)
+            S_smem[vi * K_PAD + tid] = S[vi];
+        __syncthreads();
 
-            if (tid < clen) {
-                float si = 0.0f, sc = 0.0f;
-                for (int w = 0; w < NWARPS; w++) {
-                    si += xwarp_buf[w * CHUNK * 2 + tid * 2];
-                    sc += xwarp_buf[w * CHUNK * 2 + tid * 2 + 1];
-                }
-                inter_buf[tid] = si;
-                corr_buf[tid]  = sc;
-            }
-            __syncthreads();
+        // 11. Compute Q_exp_smem = Q * exp(gamma), reload Q from global
+        for (int c = 0; c < CHUNK; c++) {
+            float qv = 0.0f;
+            if (c < clen)
+                qv = __bfloat162float(__ldg(&q[(cstart + c) * NUM_Q_HEADS * K_DIM + qk_head * K_DIM + tid]));
+            Q_exp_s[c * K_DIM + tid] = qv * exp_gamma[c];
+        }
+        __syncthreads();
 
-            // u = T̃ @ v_beta (compute into register, then write v_new)
+        // 12. Compute inter[C][V] = Q_exp @ S^T (fp32 dot products, all threads)
+        for (int idx = tid; idx < clen * V_DIM; idx += NTHREADS) {
+            int c  = idx / V_DIM;
+            int vi = idx % V_DIM;
+            float val = 0.0f;
+            for (int kk = 0; kk < K_DIM; kk++)
+                val += Q_exp_s[c * K_DIM + kk] * S_smem[vi * K_PAD + kk];
+            inter_mat[c * V_DIM + vi] = val;
+        }
+        __syncthreads();
+
+        // 13. Compute corr[C][V] = w_decay @ S^T
+        for (int idx = tid; idx < clen * V_DIM; idx += NTHREADS) {
+            int c  = idx / V_DIM;
+            int vi = idx % V_DIM;
+            float val = 0.0f;
+            for (int kk = 0; kk < K_DIM; kk++)
+                val += w_decay2[c * K_DIM + kk] * S_smem[vi * K_PAD + kk];
+            corr_mat[c * V_DIM + vi] = val;
+        }
+        __syncthreads();
+
+        // Phase 2c: v_beta, u, v_new, intra+output, state
+        // Reuse S_smem space for v_beta (only first C*V floats needed, fits in 32KB < 66KB)
+        float* v_beta = reinterpret_cast<float*>(smem + OFF_SSMEM);
+
+        // 14. Load v_beta[C][V] from global
+        for (int idx = tid; idx < clen * V_DIM; idx += NTHREADS) {
+            int c  = idx / V_DIM;
+            int vi = idx % V_DIM;
+            int pos = cstart + c;
+            float vv = __bfloat162float(__ldg(&v[pos * NUM_V_HEADS * V_DIM + head_idx * V_DIM + vi]));
+            v_beta[c * V_DIM + vi] = beta_s[c] * vv;
+        }
+        __syncthreads();
+
+        // 15. Compute v_new = u - corr (u = T̃ @ v_beta, overwrite corr in-place)
+        float* v_new = corr_mat;
+        for (int idx = tid; idx < clen * V_DIM; idx += NTHREADS) {
+            int c  = idx / V_DIM;
+            int vi = idx % V_DIM;
             float u_val = 0.0f;
-            if (tid < clen) {
-                for (int j = 0; j <= tid; j++)
-                    u_val += T_mat[tid * CHUNK + j] * v_new_buf[j];
-            }
-            __syncthreads();
+            for (int j = 0; j <= c; j++)
+                u_val += T_mat[c * CHUNK + j] * v_beta[j * V_DIM + vi];
+            v_new[c * V_DIM + vi] = u_val - corr_mat[c * V_DIM + vi];
+        }
+        __syncthreads();
 
-            if (tid < clen)
-                v_new_buf[tid] = u_val - corr_buf[tid];
-            __syncthreads();
+        // 16. Compute intra + output (fused), intra = QK @ v_new
+        for (int idx = tid; idx < clen * V_DIM; idx += NTHREADS) {
+            int c  = idx / V_DIM;
+            int vi = idx % V_DIM;
+            float intra = 0.0f;
+            for (int j = 0; j <= c; j++)
+                intra += QK_mat[c * CHUNK + j] * v_new[j * V_DIM + vi];
+            int pos = cstart + c;
+            int oidx = pos * NUM_V_HEADS * V_DIM + head_idx * V_DIM + vi;
+            output[oidx] = __float2bfloat16(scale * (inter_mat[c * V_DIM + vi] + intra));
+        }
+        __syncthreads();
 
-            // intra = QK @ v_new, write output
-            if (tid < clen) {
-                float intra = 0.0f;
-                for (int j = 0; j <= tid; j++)
-                    intra += QK_mat[tid * CHUNK + j] * v_new_buf[j];
-                int pos = cstart + tid;
-                int oidx = pos * NUM_V_HEADS * V_DIM + head_idx * V_DIM + vi;
-                output[oidx] = __float2bfloat16(scale * (inter_buf[tid] + intra));
-            }
-
-            // State delta (using precomputed K_decay)
+        // 17. State update: S[vi] = S[vi] * decay + sum_c v_new[c][vi] * K_decay[c]
+        for (int vi = 0; vi < V_DIM; vi++) {
             float delta = 0.0f;
             for (int c = 0; c < clen; c++)
-                delta += v_new_buf[c] * K_decay[c];
-            S[vi] = s_val * decay_total + delta;
-            __syncthreads();
+                delta += v_new[c * V_DIM + vi] * K_decay[c];
+            S[vi] = S[vi] * decay_total + delta;
         }
+        __syncthreads();
     }
 
     for (int vi = 0; vi < V_DIM; vi++)
@@ -299,10 +329,10 @@ void GDNPrefillKernel(
         st_p = ns_p;
     }
 
-    cudaFuncSetAttribute(gdn_prefill_chunk_kernel,
+    cudaFuncSetAttribute(gdn_prefill_phase4_kernel,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES);
 
-    gdn_prefill_chunk_kernel<<<dim3(num_seqs, NUM_V_HEADS), NTHREADS, SMEM_BYTES, stream>>>(
+    gdn_prefill_phase4_kernel<<<dim3(num_seqs, NUM_V_HEADS), NTHREADS, SMEM_BYTES, stream>>>(
         q_p, k_p, v_p, st_p, al_p, a_p, dt_p, b_p, cu_p, scale_f, o_p, ns_p);
 }
 
