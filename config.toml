@@ -1,8 +1,10 @@
 [solution]
-name = "my-team-solution-v1"      # Solution name
-definition = "fused_moe"          # Track: fused_moe | sparse_attention | gated_delta_net
-author = "team-name"              # Team/author name
+name = "gdn-decode-v1"      # Solution name
+definition = "gdn_decode_qk4_v8_d128_k_last"          # Track: fused_moe | sparse_attention | gated_delta_net
+author = "KimJangMaengShin/jsg1504"              # Team/author name
 
 [build]
-language = "triton"               # triton | cuda
-entry_point = "kernel"            # Kernel function name
+language = "cuda"               # triton | cuda
+entry_point = "kernel.cu::kernel"            # Kernel function name
+
+source_files = ["kernel.cu"]
