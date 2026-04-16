@@ -31,7 +31,7 @@ __device__ __forceinline__ float softplus(float x) {
 }
 
 template<int ROWS_PER_WARP>
-__global__ void __launch_bounds__(BLOCK_SIZE) gdn_decode_kernel(
+__global__ void __launch_bounds__(BLOCK_SIZE, 9) gdn_decode_kernel(
     const bf16* __restrict__ q,
     const bf16* __restrict__ k,
     const bf16* __restrict__ v,
@@ -59,12 +59,18 @@ __global__ void __launch_bounds__(BLOCK_SIZE) gdn_decode_kernel(
     const int warp_id = tid >> 5;
     const int lane = tid & 31;
 
-    float a_val = __bfloat162float(a[batch * NUM_V_HEADS + vh]);
-    float dt_val = dt_bias[vh];
-    float A_val = A_log[vh];
-    float g = expf(-expf(A_val) * softplus(a_val + dt_val));
-    float beta = 1.0f / (1.0f + expf(-__bfloat162float(b_gate[batch * NUM_V_HEADS + vh])));
-    float beta_g = beta * g;
+    float g, beta, beta_g;
+    if (lane == 0) {
+        float a_val = __bfloat162float(a[batch * NUM_V_HEADS + vh]);
+        float dt_val = dt_bias[vh];
+        float A_val = A_log[vh];
+        g = expf(-expf(A_val) * softplus(a_val + dt_val));
+        beta = 1.0f / (1.0f + expf(-__bfloat162float(b_gate[batch * NUM_V_HEADS + vh])));
+        beta_g = beta * g;
+    }
+    g = __shfl_sync(0xffffffff, g, 0);
+    beta = __shfl_sync(0xffffffff, beta, 0);
+    beta_g = __shfl_sync(0xffffffff, beta_g, 0);
 
     const int k_base = batch * NUM_K_HEADS * HEAD_DIM + qkh * HEAD_DIM + (lane << 2);
     float k_vals[4];
