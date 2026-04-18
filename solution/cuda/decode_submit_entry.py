@@ -19,7 +19,6 @@ _ANNOUNCED_BUILD_KEYS: set[tuple[str, str, str]] = set()
 class _BuildArtifact:
     mod: Any
     module_name: str
-    lib_path: str
     build_dir: Path
     arch_list: str
     source_key: tuple[str, str, str]
@@ -49,6 +48,13 @@ def _force_exact_cuda_arch() -> tuple[str | None, str]:
     previous = os.environ.get("TVM_FFI_CUDA_ARCH_LIST")
     os.environ["TVM_FFI_CUDA_ARCH_LIST"] = _EXACT_CUDA_ARCH_LIST
     return previous, _EXACT_CUDA_ARCH_LIST
+
+
+def _restore_cuda_arch(previous: str | None) -> None:
+    if previous is None:
+        os.environ.pop("TVM_FFI_CUDA_ARCH_LIST", None)
+        return
+    os.environ["TVM_FFI_CUDA_ARCH_LIST"] = previous
 
 
 def _ensure_cuda_home() -> str:
@@ -98,43 +104,50 @@ def _load_mod() -> _BuildArtifact:
     kernel_path = solution_dir / "kernel.cu"
     entry_path = solution_dir / "decode_submit_entry.py"
     previous_arch, active_arch = _force_exact_cuda_arch()
-    cuda_home = _ensure_cuda_home()
-    source_key = (_file_digest(kernel_path), _file_digest(entry_path), active_arch)
-    cached = _MODULE_CACHE.get(source_key)
-    if cached is not None:
-        _announce_build_surface(cached, previous_arch)
-        return cached
-
-    module_name = (
-        "gdn_decode_submit_tvmffi_ext_"
-        f"{source_key[0][:8]}_{source_key[1][:8]}_{active_arch.replace('.', '')}"
-    )
     try:
-        lib_path = tvm_ffi.cpp.build(
-            name=module_name,
-            cuda_files=[str(solution_dir / "kernel.cu")],
+        cuda_home = _ensure_cuda_home()
+        source_key = (_file_digest(kernel_path), _file_digest(entry_path), active_arch)
+        cached = _MODULE_CACHE.get(source_key)
+        if cached is not None:
+            _announce_build_surface(cached, previous_arch)
+            return cached
+
+        module_name = (
+            "gdn_decode_submit_tvmffi_ext_"
+            f"{source_key[0][:8]}_{source_key[1][:8]}_{active_arch.replace('.', '')}"
         )
-    except RuntimeError as exc:
-        if "Could not find CUDA installation" in str(exc):
+        try:
+            lib_path = tvm_ffi.cpp.build(
+                name=module_name,
+                cuda_files=[str(solution_dir / "kernel.cu")],
+            )
+        except RuntimeError as exc:
+            if "Could not find CUDA installation" in str(exc):
+                raise RuntimeError(
+                    "decode exact-surface runtime compile requires CUDA_HOME/nvcc visibility. "
+                    f"Resolved CUDA_HOME={cuda_home}. Original error: {exc}"
+                ) from exc
+            raise
+        build_dir = Path(lib_path).resolve().parent
+        artifact = _BuildArtifact(
+            mod=tvm_ffi.load_module(lib_path),
+            module_name=module_name,
+            build_dir=build_dir,
+            arch_list=active_arch,
+            source_key=source_key,
+            arch_proof=_classify_arch_proof(build_dir),
+            cuda_home=cuda_home,
+        )
+        if artifact.arch_proof != "hard":
             raise RuntimeError(
-                "decode exact-surface runtime compile requires CUDA_HOME/nvcc visibility. "
-                f"Resolved CUDA_HOME={cuda_home}. Original error: {exc}"
-            ) from exc
-        raise
-    build_dir = Path(lib_path).resolve().parent
-    artifact = _BuildArtifact(
-        mod=tvm_ffi.load_module(lib_path),
-        module_name=module_name,
-        lib_path=lib_path,
-        build_dir=build_dir,
-        arch_list=active_arch,
-        source_key=source_key,
-        arch_proof=_classify_arch_proof(build_dir),
-        cuda_home=cuda_home,
-    )
-    _MODULE_CACHE[source_key] = artifact
-    _announce_build_surface(artifact, previous_arch)
-    return artifact
+                "decode exact-surface runtime compile did not produce hard sm_100a proof. "
+                f"proof={artifact.arch_proof} build_dir={artifact.build_dir}"
+            )
+        _MODULE_CACHE[source_key] = artifact
+        _announce_build_surface(artifact, previous_arch)
+        return artifact
+    finally:
+        _restore_cuda_arch(previous_arch)
 
 
 def _ensure_contiguous_output(tensor: torch.Tensor) -> tuple[torch.Tensor, bool]:
