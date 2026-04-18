@@ -13,6 +13,10 @@ import tvm_ffi.cpp
 _EXACT_CUDA_ARCH_LIST = "10.0a"
 _EXACT_CUDA_GENCODE_FLAG = "-gencode=arch=compute_100a,code=sm_100a"
 _ANNOUNCED_BUILD_KEYS: set[tuple[str, str, str]] = set()
+_SOLUTION_DIR = Path(__file__).resolve().parent
+_KERNEL_PATH = _SOLUTION_DIR / "kernel.cu"
+_ENTRY_PATH = _SOLUTION_DIR / "decode_submit_entry.py"
+_SOURCE_KEY_CACHE: dict[tuple[int, int, int, int, str], tuple[str, str, str]] = {}
 
 
 @dataclass(frozen=True)
@@ -42,6 +46,25 @@ def _normalize_scale(scale: Any, head_dim: int) -> float:
 
 def _file_digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+
+
+def _source_key(active_arch: str) -> tuple[str, str, str]:
+    kernel_stat = _KERNEL_PATH.stat()
+    entry_stat = _ENTRY_PATH.stat()
+    cache_key = (
+        kernel_stat.st_mtime_ns,
+        kernel_stat.st_size,
+        entry_stat.st_mtime_ns,
+        entry_stat.st_size,
+        active_arch,
+    )
+    cached = _SOURCE_KEY_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    source_key = (_file_digest(_KERNEL_PATH), _file_digest(_ENTRY_PATH), active_arch)
+    _SOURCE_KEY_CACHE.clear()
+    _SOURCE_KEY_CACHE[cache_key] = source_key
+    return source_key
 
 
 def _force_exact_cuda_arch() -> tuple[str | None, str]:
@@ -100,13 +123,10 @@ def _announce_build_surface(artifact: _BuildArtifact, previous_arch: str | None)
 
 
 def _load_mod() -> _BuildArtifact:
-    solution_dir = Path(__file__).resolve().parent
-    kernel_path = solution_dir / "kernel.cu"
-    entry_path = solution_dir / "decode_submit_entry.py"
     previous_arch, active_arch = _force_exact_cuda_arch()
     try:
         cuda_home = _ensure_cuda_home()
-        source_key = (_file_digest(kernel_path), _file_digest(entry_path), active_arch)
+        source_key = _source_key(active_arch)
         cached = _MODULE_CACHE.get(source_key)
         if cached is not None:
             _announce_build_surface(cached, previous_arch)
@@ -119,7 +139,7 @@ def _load_mod() -> _BuildArtifact:
         try:
             lib_path = tvm_ffi.cpp.build(
                 name=module_name,
-                cuda_files=[str(solution_dir / "kernel.cu")],
+                cuda_files=[str(_KERNEL_PATH)],
             )
         except RuntimeError as exc:
             if "Could not find CUDA installation" in str(exc):
