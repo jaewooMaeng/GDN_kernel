@@ -5,8 +5,6 @@ author = "KimJangMaengShin/jsg1504"
 
 [build]
 language = "cuda"
-entry_point = "decode_submit_entry.py::run"
-dependencies = ["nvidia-cutlass-dsl", "cuda-python>=12.8"]
-destination_passing_style = true
+entry_point = "kernel.cu::kernel"
 
-source_files = ["kernel.cu", "decode_submit_entry.py"]
+source_files = ["kernel.cu"]
