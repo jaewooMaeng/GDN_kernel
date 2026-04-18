@@ -22,6 +22,7 @@ _SOURCE_KEY_CACHE: dict[tuple[int, int, int, int, str], tuple[str, str, str]] = 
 @dataclass(frozen=True)
 class _BuildArtifact:
     mod: Any
+    kernel: Any
     module_name: str
     build_dir: Path
     arch_list: str
@@ -151,6 +152,7 @@ def _load_mod() -> _BuildArtifact:
         build_dir = Path(lib_path).resolve().parent
         artifact = _BuildArtifact(
             mod=tvm_ffi.load_module(lib_path),
+            kernel=tvm_ffi.load_module(lib_path)["kernel"],
             module_name=module_name,
             build_dir=build_dir,
             arch_list=active_arch,
@@ -176,6 +178,12 @@ def _ensure_contiguous_output(tensor: torch.Tensor) -> tuple[torch.Tensor, bool]
     return tensor.contiguous(), True
 
 
+def _ensure_contiguous_input(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.is_contiguous():
+        return tensor
+    return tensor.contiguous()
+
+
 def run(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -195,18 +203,18 @@ def run(
     artifact = _load_mod()
     scale_val = _normalize_scale(scale, q.shape[-1])
 
-    q = q.contiguous()
-    k = k.contiguous()
-    v = v.contiguous()
-    state = state.contiguous()
-    A_log = A_log.contiguous()
-    a = a.contiguous()
-    dt_bias = dt_bias.contiguous()
-    b = b.contiguous()
+    q = _ensure_contiguous_input(q)
+    k = _ensure_contiguous_input(k)
+    v = _ensure_contiguous_input(v)
+    state = _ensure_contiguous_input(state)
+    A_log = _ensure_contiguous_input(A_log)
+    a = _ensure_contiguous_input(a)
+    dt_bias = _ensure_contiguous_input(dt_bias)
+    b = _ensure_contiguous_input(b)
     output_buffer, copy_output_back = _ensure_contiguous_output(output)
     new_state_buffer, copy_state_back = _ensure_contiguous_output(new_state)
 
-    artifact.mod["kernel"](
+    artifact.kernel(
         q,
         k,
         v,
