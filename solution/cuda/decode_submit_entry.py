@@ -32,6 +32,7 @@ class _BuildArtifact:
 
 
 _MODULE_CACHE: dict[tuple[str, str, str], _BuildArtifact] = {}
+_ACTIVE_ARTIFACT: _BuildArtifact | None = None
 
 
 def _normalize_scale(scale: Any, head_dim: int) -> float:
@@ -124,12 +125,17 @@ def _announce_build_surface(artifact: _BuildArtifact, previous_arch: str | None)
 
 
 def _load_mod() -> _BuildArtifact:
+    global _ACTIVE_ARTIFACT
+    if _ACTIVE_ARTIFACT is not None:
+        return _ACTIVE_ARTIFACT
+
     previous_arch, active_arch = _force_exact_cuda_arch()
     try:
         cuda_home = _ensure_cuda_home()
         source_key = _source_key(active_arch)
         cached = _MODULE_CACHE.get(source_key)
         if cached is not None:
+            _ACTIVE_ARTIFACT = cached
             _announce_build_surface(cached, previous_arch)
             return cached
 
@@ -164,8 +170,9 @@ def _load_mod() -> _BuildArtifact:
             raise RuntimeError(
                 "decode exact-surface runtime compile did not produce hard sm_100a proof. "
                 f"proof={artifact.arch_proof} build_dir={artifact.build_dir}"
-            )
+        )
         _MODULE_CACHE[source_key] = artifact
+        _ACTIVE_ARTIFACT = artifact
         _announce_build_surface(artifact, previous_arch)
         return artifact
     finally:
