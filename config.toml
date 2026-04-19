@@ -1,10 +1,12 @@
 [solution]
-name = "gdn-decode-v1"
+name = "gdn-decode-v2"
 definition = "gdn_decode_qk4_v8_d128_k_last"
-author = "KimJangMaengShin/jsg1504"
+author = "MSInfer"
 
 [build]
 language = "cuda"
-entry_point = "kernel.cu::kernel"
+entry_point = "decode_submit_entry.py::run"
+dependencies = ["nvidia-cutlass-dsl", "cuda-python>=12.8"]
+destination_passing_style = true
 
-source_files = ["kernel.cu"]
+source_files = ["kernel.cu", "decode_submit_entry.py"]
