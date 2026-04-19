@@ -39,7 +39,13 @@ LOCAL_DECODE_DEFINITION = "gdn_decode_qk4_v8_d128_k_last"
 
 image = (
     modal.Image.from_registry("nvidia/cuda:13.0.2-devel-ubuntu24.04", add_python="3.12")
-    .env({"CUDA_HOME": "/usr/local/cuda", "TORCH_CUDA_ARCH_LIST": "10.0a"})
+    .env(
+        {
+            "CUDA_HOME": "/usr/local/cuda",
+            "TORCH_CUDA_ARCH_LIST": "10.0a",
+            "TVM_FFI_CUDA_ARCH_LIST": "10.0a",
+        }
+    )
     .pip_install("flashinfer-bench", "flashinfer-python", "torch", "triton", "numpy")
 )
 
@@ -187,6 +193,11 @@ def run_benchmark(
     return results
 
 
+def _format_latency_pair(latency_ms: float) -> str:
+    latency_us = latency_ms * 1000.0
+    return f"{latency_us:.3f} µs ({latency_ms:.6f} ms)"
+
+
 def print_results(results: dict, summary_only: bool = False):
     """Print benchmark results in a formatted way."""
     for def_name, traces in results.items():
@@ -213,7 +224,8 @@ def print_results(results: dict, summary_only: bool = False):
         print(f"  workloads: {total}")
         print("  status counts:", ", ".join(f"{k}={v}" for k, v in sorted(statuses.items())))
         if latency_values:
-            print(f"  avg latency: {sum(latency_values) / len(latency_values):.3f} ms")
+            avg_latency_ms = sum(latency_values) / len(latency_values)
+            print(f"  avg latency: {_format_latency_pair(avg_latency_ms)}")
         if speedup_values:
             print(f"  avg speedup: {sum(speedup_values) / len(speedup_values):.2f}x")
         if abs_errors:
@@ -236,7 +248,7 @@ def print_results(results: dict, summary_only: bool = False):
             print(f"  Workload {workload_uuid[:8]}...: {status}", end="")
 
             if result.get("latency_ms") is not None:
-                print(f" | {result['latency_ms']:.3f} ms", end="")
+                print(f" | {_format_latency_pair(result['latency_ms'])}", end="")
 
             if result.get("speedup_factor") is not None:
                 print(f" | {result['speedup_factor']:.2f}x speedup", end="")
@@ -281,6 +293,10 @@ def main(
     workload_uuid_prefixes: str = "",
     quick: bool = False,
     decision_gate: bool = False,
+    precise: bool = False,
+    warmup_runs: int = 0,
+    iterations: int = 0,
+    num_trials: int = 0,
     decode_path_mode: str = "auto",
 ):
     """Load the solution and run benchmark on Modal."""
@@ -288,7 +304,19 @@ def main(
     solution = load_solution(Path(solution_path) if solution_path else None)
 
     config = None
-    if decision_gate:
+    if quick:
+        config = BenchmarkConfig(
+            warmup_runs=1,
+            iterations=1,
+            num_trials=1,
+            use_isolated_runner=False,
+            timeout_seconds=300,
+        )
+        log_event(
+            "Quick mode enabled: warmup_runs=1, iterations=1, num_trials=1, "
+            "use_isolated_runner=False"
+        )
+    elif decision_gate:
         config = BenchmarkConfig(
             warmup_runs=1,
             iterations=5,
@@ -300,17 +328,21 @@ def main(
             "Decision-gate mode enabled: warmup_runs=1, iterations=5, num_trials=2, "
             "use_isolated_runner=False"
         )
-    elif quick:
+    elif precise or warmup_runs > 0 or iterations > 0 or num_trials > 0:
+        effective_warmup = warmup_runs if warmup_runs > 0 else 3
+        effective_iterations = iterations if iterations > 0 else 20
+        effective_trials = num_trials if num_trials > 0 else 5
         config = BenchmarkConfig(
-            warmup_runs=1,
-            iterations=1,
-            num_trials=1,
-            use_isolated_runner=False,
+            warmup_runs=effective_warmup,
+            iterations=effective_iterations,
+            num_trials=effective_trials,
+            use_isolated_runner=True,
             timeout_seconds=300,
         )
         log_event(
-            "Quick mode enabled: warmup_runs=1, iterations=1, num_trials=1, "
-            "use_isolated_runner=False"
+            "Precise mode enabled: "
+            f"warmup_runs={effective_warmup}, iterations={effective_iterations}, "
+            f"num_trials={effective_trials}, use_isolated_runner=True"
         )
 
     log_event("Dispatching benchmark to Modal B200...")
