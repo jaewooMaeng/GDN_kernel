@@ -1,0 +1,8 @@
+- 병렬로 계산할 수 있는 행렬들 하나로 합치기
+- tensor core 형태랑 맞춰서 자를 수 있게 chunk size 자동 조절 (seq_len, GQA 등 여부에 따라)
+- load - compute overlap
+- sequential하게 계산되어야 하는 것 수학적으로 최적화
+    - e.g. prefix_sum을 머지소트처럼 한다던가
+- sync thread 최대한 줄여볼 것 (kernel fusion) → memory scheduling과 연관 있을 듯
+- register에 caching할 수 있는 것 최대한 할 것
+- memory placement 최적화 (double buffering)

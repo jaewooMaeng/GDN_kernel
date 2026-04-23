@@ -1,0 +1,13 @@
+# 로컬 도구: pack_solution, run_modal 등
+#
+#   conda activate fi-bench
+#   python -m pip install -r requirements.txt
+#
+# macOS(ARM): flashinfer-bench 는 PyPI 메타데이터상 Linux 전용 의존성 때문에
+# requirements 에서 제외합니다. 아래를 추가로 실행하세요.
+#   python -m pip install "flashinfer-bench==0.1.2" --no-deps
+#   python -m pip install torch pydantic safetensors "apache-tvm-ffi>=0.1.2" docstring-parser packaging
+# (이미 설치된 항목은 알아서 건너뜁니다.)
+
+modal>=1.3,<2
+flashinfer-bench==0.1.2; sys_platform == "linux"

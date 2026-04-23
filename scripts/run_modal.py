@@ -17,6 +17,11 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
+
 import modal
 from flashinfer_bench import Benchmark, BenchmarkConfig, Solution, TraceSet
 
@@ -25,17 +30,36 @@ app = modal.App("flashinfer-bench")
 trace_volume = modal.Volume.from_name("flashinfer-trace", create_if_missing=True)
 TRACE_SET_PATH = "/data"
 
-image = (
-    modal.Image.from_registry("nvidia/cuda:13.0.2-devel-ubuntu24.04", add_python="3.12")
-    .pip_install("flashinfer-bench", "torch", "triton", "numpy")
-)
+
+def _modal_pip_packages() -> list[str]:
+    """Base image packages plus optional `build.dependencies` from config.toml."""
+    base = ["flashinfer-bench", "torch", "triton", "numpy"]
+    extra: list[str] = []
+    cfg_path = PROJECT_ROOT / "config.toml"
+    if cfg_path.exists():
+        with open(cfg_path, "rb") as f:
+            data = tomllib.load(f)
+        raw = data.get("build", {}).get("dependencies") or []
+        extra = [str(x).strip() for x in raw if str(x).strip()]
+    seen: set[str] = set()
+    out: list[str] = []
+    for p in base + extra:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+
+image = modal.Image.from_registry(
+    "nvidia/cuda:13.0.2-devel-ubuntu24.04", add_python="3.12"
+).pip_install(*_modal_pip_packages())
 
 
 @app.function(image=image, gpu="B200:1", timeout=3600, volumes={TRACE_SET_PATH: trace_volume})
 def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
     """Run benchmark on Modal B200 and return results."""
     if config is None:
-        config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
+        config = BenchmarkConfig(warmup_runs=3, iterations=20, num_trials=5, use_isolated_runner=True)
 
     trace_set = TraceSet.from_path(TRACE_SET_PATH)
 
@@ -82,6 +106,7 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
 
 def print_results(results: dict):
     """Print benchmark results in a formatted way."""
+    latency_ms_values: list[float] = []
     for def_name, traces in results.items():
         print(f"\n{def_name}:")
         for workload_uuid, result in traces.items():
@@ -89,6 +114,7 @@ def print_results(results: dict):
             print(f"  Workload {workload_uuid[:8]}...: {status}", end="")
 
             if result.get("latency_ms") is not None:
+                latency_ms_values.append(result["latency_ms"])
                 print(f" | {result['latency_ms']:.3f} ms", end="")
 
             if result.get("speedup_factor") is not None:
@@ -100,6 +126,10 @@ def print_results(results: dict):
                 print(f" | abs_err={abs_err:.2e}, rel_err={rel_err:.2e}", end="")
 
             print()
+
+    if latency_ms_values:
+        mean_latency_ms = sum(latency_ms_values) / len(latency_ms_values)
+        print(f"\nMean latency_ms (arithmetic): {mean_latency_ms:.3f} ms")
 
 
 @app.local_entrypoint()

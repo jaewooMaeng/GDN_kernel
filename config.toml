@@ -4,5 +4,6 @@ definition = "gdn_decode_qk4_v8_d128_k_last"          # Track: fused_moe | spars
 author = "KimJangMaengShin/jsg1504"              # Team/author name
 
 [build]
-language = "cuda"               # triton | cuda
-entry_point = "kernel.cu::kernel"            # Kernel function name
+language = "cuda"                 # python | triton | cuda
+entry_point = "kernel.cu::kernel"   # Entry point: <file_path>::<function_name>
+destination_passing_style = true

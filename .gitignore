@@ -148,6 +148,7 @@ celerybeat.pid
 .env
 .envrc
 .venv
+.venv_workflow/
 env/
 venv/
 ENV/

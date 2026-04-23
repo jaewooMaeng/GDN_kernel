@@ -1,0 +1,23 @@
+# Conda: 베이스만 여기서 잡고, pip 패키지는 requirements.txt 로 설치합니다.
+# (conda가 pip에 -U를 붙이면서 flashinfer 의존성이 macOS에서 깨지는 경우를 피하기 위함)
+#
+#   conda env create -f environment.yml
+#   conda activate fi-bench
+#   python -m pip install -r requirements.txt
+#
+# 이미 fi-bench 가 있으면:
+#   conda env update -f environment.yml --prune
+#   conda activate fi-bench
+#   python -m pip install -r requirements.txt
+#
+# `conda run -n fi-bench pip ...` 대신 위처럼 activate 후 `python -m pip` 을 쓰면
+# PATH에 pyenv/shim 이 있어도 Conda 환경의 Python이 확실히 사용됩니다.
+# requirements.txt 안에 macOS 설치 우회 절차가 더 적혀 있습니다.
+
+name: fi-bench
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - numpy

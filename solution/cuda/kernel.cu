@@ -74,17 +74,27 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 9) gdn_decode_kernel(
 
     const int k_base = batch * NUM_K_HEADS * HEAD_DIM + qkh * HEAD_DIM + (lane << 2);
     float k_vals[4];
-    k_vals[0] = __bfloat162float(k[k_base]);
-    k_vals[1] = __bfloat162float(k[k_base + 1]);
-    k_vals[2] = __bfloat162float(k[k_base + 2]);
-    k_vals[3] = __bfloat162float(k[k_base + 3]);
+    {
+        uint2 packed = *reinterpret_cast<const uint2*>(k + k_base);
+        __nv_bfloat162 lo = *reinterpret_cast<__nv_bfloat162*>(&packed.x);
+        __nv_bfloat162 hi = *reinterpret_cast<__nv_bfloat162*>(&packed.y);
+        float2 lof = __bfloat1622float2(lo);
+        float2 hif = __bfloat1622float2(hi);
+        k_vals[0] = lof.x; k_vals[1] = lof.y;
+        k_vals[2] = hif.x; k_vals[3] = hif.y;
+    }
 
     const int q_base = batch * NUM_Q_HEADS * HEAD_DIM + qkh * HEAD_DIM + (lane << 2);
     float q_vals[4];
-    q_vals[0] = __bfloat162float(q[q_base]);
-    q_vals[1] = __bfloat162float(q[q_base + 1]);
-    q_vals[2] = __bfloat162float(q[q_base + 2]);
-    q_vals[3] = __bfloat162float(q[q_base + 3]);
+    {
+        uint2 packed = *reinterpret_cast<const uint2*>(q + q_base);
+        __nv_bfloat162 lo = *reinterpret_cast<__nv_bfloat162*>(&packed.x);
+        __nv_bfloat162 hi = *reinterpret_cast<__nv_bfloat162*>(&packed.y);
+        float2 lof = __bfloat1622float2(lo);
+        float2 hif = __bfloat1622float2(hi);
+        q_vals[0] = lof.x; q_vals[1] = lof.y;
+        q_vals[2] = hif.x; q_vals[3] = hif.y;
+    }
 
     float qk_local = q_vals[0]*k_vals[0] + q_vals[1]*k_vals[1]
                    + q_vals[2]*k_vals[2] + q_vals[3]*k_vals[3];
@@ -181,6 +191,38 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 9) gdn_decode_kernel(
     }
 }
 
+static bool g_l2_persistence_setup = false;
+static size_t g_persist_max_bytes = 0;
+static cudaStream_t g_last_stream = nullptr;
+static const void* g_last_state_ptr = nullptr;
+static size_t g_last_state_bytes = 0;
+
+static __forceinline__ void setup_l2_persistence(cudaStream_t stream, const void* state_ptr, size_t state_bytes) {
+    if (__builtin_expect(!g_l2_persistence_setup, 0)) {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceProp prop;
+        cudaGetDeviceProperties(&prop, dev);
+        g_persist_max_bytes = prop.persistingL2CacheMaxSize;
+        cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, g_persist_max_bytes);
+        g_l2_persistence_setup = true;
+    }
+    if (stream == g_last_stream && state_ptr == g_last_state_ptr && state_bytes == g_last_state_bytes) {
+        return;
+    }
+    g_last_stream = stream;
+    g_last_state_ptr = state_ptr;
+    g_last_state_bytes = state_bytes;
+    float hit_ratio = state_bytes > 0 ? fminf((float)g_persist_max_bytes / (float)state_bytes, 1.0f) : 1.0f;
+    cudaStreamAttrValue attr = {};
+    attr.accessPolicyWindow.base_ptr  = const_cast<void*>(state_ptr);
+    attr.accessPolicyWindow.num_bytes = state_bytes;
+    attr.accessPolicyWindow.hitRatio  = hit_ratio;
+    attr.accessPolicyWindow.hitProp   = cudaAccessPropertyPersisting;
+    attr.accessPolicyWindow.missProp  = cudaAccessPropertyNormal;
+    cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &attr);
+}
+
 void gdn_decode(
     tvm::ffi::TensorView q,
     tvm::ffi::TensorView k,
@@ -196,12 +238,18 @@ void gdn_decode(
 ) {
     int batch_size = q.size(0);
 
-    int split_factor = (batch_size <= 2) ? 8 : 4;
+    int split_factor;
+    if (batch_size <= 2) split_factor = 8;
+    else if (batch_size < 32) split_factor = 4;
+    else split_factor = 2;
     int rows_per_warp = HEAD_DIM / split_factor / NUM_WARPS;
 
     DLDevice dev = q.device();
     cudaStream_t stream = static_cast<cudaStream_t>(
         TVMFFIEnvGetStream(dev.device_type, dev.device_id));
+
+    size_t state_bytes = (size_t)batch_size * NUM_V_HEADS * HEAD_DIM * HEAD_DIM * sizeof(float);
+    setup_l2_persistence(stream, state.data_ptr(), state_bytes);
 
     dim3 grid(batch_size * NUM_V_HEADS * split_factor);
     dim3 block(BLOCK_SIZE);
@@ -225,6 +273,7 @@ void gdn_decode(
     switch (rows_per_warp) {
         case 4:  LAUNCH(4);  break;
         case 8:  LAUNCH(8);  break;
+        case 16: LAUNCH(16); break;
         default: LAUNCH(8);  break;
     }
     #undef LAUNCH
