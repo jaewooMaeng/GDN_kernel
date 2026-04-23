@@ -376,3 +376,18 @@ Key NCU fields to compare:
   - B1 2-CTA cluster q/k 공유: `V_PER_Q=2` 중복 q/k read와 qk_dot 중복을 줄이면서 kernel body Duration 자체를 줄이는 방향.
   - A2/A3 저위험 메모리 힌트 (`cuda::annotated_ptr`, read-only load path 확인): shared-memory 구조 변경 없이 state read path를 다듬는 방향.
   - G5 + SASS/ptxas 기준선 재고정: accepted kernel의 `Registers/thread=56`, spill 0, `LDG/FFMA/SHFL` 비율을 먼저 고정해 다음 구조 변경 리스크를 낮출 것.
+
+## iter #6
+
+- 적용한 최적화: `batch_size >= 32` large-batch 경로만 256-thread / 8-warp variant로 분기. `split_factor=2`는 유지하고, large-batch path의 `ROWS_PER_WARP`를 8로 낮춰 per-CTA active warps와 bytes-in-flight를 늘리려 했다. 첫 full benchmark regression으로 전체 롤백함.
+- 측정된 avg latency: 1회 `0.012979 ms`, correctness `PASSED=54/54`. Phase 3+는 5회 median 판정이 원칙이지만, 핵심 타깃 B=64 workload `eaf0a285`가 `0.023968 ms`로 baseline(`0.021~0.022 ms`)보다 명확히 느려 workflow의 즉시 롤백 규칙에 따라 추가 4회 반복 없이 중단했다. 롤백 후 accepted latency는 `0.012920 ms`를 유지한다.
+- NCU Duration: 롤백 후 현재 accepted kernel 기준 `33.06 us`.
+- 남아있는 주요 bottleneck: rollback 후 profiled kernel은 `Grid Size=1024`, `Waves/SM=0.77`, `Issue Slots Busy=17.62%`, `Memory Throughput=29.02%`, `DRAM Throughput=23.83%`, `L1/TEX Throughput=46.47%`, `L2 Throughput=19.81%`, `Achieved Occupancy=27.71%`, `Registers/thread=56`, local spilling `0`, `L1 hit=5.37%`, `L2 hit=1.53%`다. 여전히 single-pipeline 포화가 아니라 small-grid / low-issue / register-limited occupancy / poor-cache-hit 성격이 강하다.
+- 이번에 시도했거나 검토했지만 안 좋다고 판단한 방향:
+  - 후보: `batch_size >= 32` 전용 256-thread / 8-warp large-batch kernel.
+  - 안 좋은 이유: NCU의 low-wave / low-issue 지표와는 맞는 접근이었지만, standalone 256-thread 확대만으로는 이득이 나지 않았다. 전체 avg가 `0.012979 ms`로 baseline `0.012920 ms`보다 소폭 악화됐고, 핵심 타깃 B=64 workload `eaf0a285`는 `0.023968 ms`로 baseline(`0.021~0.022 ms`)보다 느려졌다. per-block parallelism 증대 이득보다 q/k load 및 qk reduction의 warp 중복, `ROWS_PER_WARP=8`로 인한 per-warp ILP 감소가 더 컸던 것으로 본다.
+  - 재시도 가능 조건: q/k를 block shared 또는 2-CTA cluster에서 1회만 로드/감산하도록 묶어 warp 중복을 줄이거나, ptxas/SASS 기준선에서 register 수를 더 낮춰 256-thread path가 4-blocks/SM 이상으로 안정적으로 올라갈 근거가 생길 때. 현재의 standalone 256-thread 분기 단독안은 재시도하지 않음.
+- 다음 iteration 에서 시도할만한 후보 2~3 개:
+  - B1 2-CTA cluster q/k 공유: `V_PER_Q=2` 중복 q/k read와 qk_dot 중복 자체를 줄이는 방향이라 이번 실패 이유와 직접 맞물린다.
+  - A2/A3 저위험 메모리 힌트 (`cuda::annotated_ptr`, read-only load path 확인): current kernel shape를 바꾸지 않고 state/qk read path를 다듬는 방향.
+  - G5 + SASS/ptxas 기준선 재고정: accepted kernel의 `Registers/thread=56`, spill 0, `LDG/FFMA/SHFL` 비율을 먼저 고정해 다음 구조 변경의 실패 이유를 더 명확히 볼 것.
