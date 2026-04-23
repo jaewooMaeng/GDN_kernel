@@ -238,7 +238,7 @@ setmaxnreg.inc.sync.aligned.u32 N / setmaxnreg.dec.sync.aligned.u32 N
 **참조**: CUDA Math API 문서 (`__fmaf_rn`, `__reduce_add_sync`), PTX ISA `redux.sync`, `wgmma.mma_async`.
 
 - [x] **C1. Gate 계산 lane 0 집중 + shuffle broadcast** [적용됨 Iter 20]: SFU throughput 경쟁 해소, Phase 2 break-through.
-- [ ] **C2. `__reduce_add_sync()` intrinsic으로 warp reduction 대체**: 현재 5-stage `__shfl_down_sync` butterfly. SM100 native `redux.sync.add.f32` 1-instruction. `-arch=sm_100a` 필수. PTX `redux.sync` 생성 확인.
+- [ ] **C2. `__reduce_add_sync()` intrinsic으로 warp reduction 대체**: 현재 5-stage `__shfl_down_sync` butterfly. SM100 native `redux.sync.add.f32` 1-instruction. `-arch=sm_100a` 필수. PTX `redux.sync` 생성 확인. **[시도됨 iter #3, build blocked]** 현재 Modal `tvm_ffi`/nvcc 경로에서는 `__reduce_add_sync(float)` overload가 보이지 않아 전 workload compile failure가 났다. inline PTX `redux.sync.add.f32` 또는 다른 toolchain에서 overload/SASS를 확인할 때만 재시도.
 - [ ] **C3. 명시적 FMA (`__fmaf_rn()`)**: 현재 dot product / state update가 nvcc FMA 자동 생성 의존. PTX 생성 물(FFMA vs FADD+FMUL) 검증 후 미생성 구간 명시적 호출.
 - [ ] **C4. k_vals/q_vals를 `float4` 자료형으로 유지**: 현재 개별 float 배열. `float4 k4, q4;`로 보관 → nvcc FFMA4 자동 생성 유도, state `float4`와 layout 일치.
 - [ ] **C5. Output 계산 fusion 추가**: `scale_g * qs_x + scale_qk * res_x` 이미 pre-computed 상수 활용. 추가 여지 낮음.
@@ -405,12 +405,15 @@ B200 SM ≈ 148:
 | 20 ✅✅✅ | **gate lane 0 + shfl broadcast** | **0.010 best / 0.012 median** | **Phase 2 달성** |
 | R1 | B≥32 split=4로 grid 2배 확대 | 0.012920 median | 롤백 |
 | R2 | q/k/v shared staging + gate block 1회 계산 | 0.013278 avg | 롤백 |
+| R3 | split-local `s_v` staging + carveout=0 (`__reduce_add_sync(float)`는 build blocked) | 0.013244 median | 롤백 |
 
 **핵심 인사이트 (Iter 20)**: 32 lanes 동시 exp/log1p → SFU throughput 심각 경쟁. Lane 0 전담 + 3 shuffle로 SFU 경쟁 완전 제거 = Phase 2 break-through.
 
 **R1 인사이트**: B=64의 `waves/SM` 부족을 단순 split 증가로 해결하려 했지만 B=64 latency가 기존 `0.021~0.022 ms`에서 `0.024~0.029 ms`로 악화. grid 증가만으로는 부족하고 q/k/v/gate 중복 제거 또는 launch overhead 제거가 필요.
 
 **R2 인사이트**: block-invariant q/k/gate 중복 자체는 존재하지만, q/k/v를 shared에 올리는 축소형 E1은 현재 커널의 핵심 비용인 state row streaming을 줄이지 못했다. 반대로 shared scalar load와 block-wide barrier만 늘어나 B=64가 `0.024691 ms`로 악화됐다. 같은 계열은 cluster 공유나 qk reduction 1회화처럼 더 큰 중복 제거가 동반될 때만 재검토한다.
+
+**R3 인사이트**: block이 실제로 쓰는 `v` row만 shared에 적재하고 `PreferredSharedMemoryCarveout=0`를 줘도 benchmark는 개선되지 않았다. 5회 avg가 `[0.012954, 0.013378, 0.013142, 0.013244, 0.017654] ms`로 튀었고 median이 `0.013244 ms`까지 악화됐다. `__reduce_add_sync(float)`도 현재 build path에서 바로 쓸 수 없었으므로, 다음에는 launch overhead 제거(D5)나 CTA 간 q/k 공유(B1)처럼 더 큰 구조적 중복 제거를 우선한다.
 
 ### Phase 3+ 기록 템플릿
 

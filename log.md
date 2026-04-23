@@ -325,3 +325,21 @@ Key NCU fields to compare:
   - D5 CUDA Graph capture feasibility: kernel Duration보다 benchmark avg/median에 직접적인 레버리지가 큼. 포인터 안정성과 graph cache invalidation 규칙부터 확인.
   - B1 2-CTA cluster q/k 공유: `V_PER_Q=2` 중복 q/k load를 줄이되, 단순 shared staging보다 큰 중복 제거를 노릴 수 있음.
   - G5 + C2 묶음 검토: ptxas/SASS 기준선 확인 후 `__reduce_add_sync` 또는 동등한 warp-reduction 축소가 실제 hot loop shuffle 수를 줄일 수 있는지 검증.
+
+## iter #3
+
+- 적용한 최적화: (1) `__reduce_add_sync(float)` 기반 warp reduction 축소를 시도했으나 현재 Modal `tvm_ffi`/nvcc 경로에서 compile blocked, (2) block이 실제로 사용하는 `v` slice만 shared에 적재하도록 `s_v` 범위를 `ROWS_PER_BLOCK`로 축소, (3) `cudaFuncAttributePreferredSharedMemoryCarveout=0` 적용. 5회 benchmark median 후퇴로 전체 롤백함.
+- 측정된 avg latency: 5회 `[0.012954, 0.013378, 0.013142, 0.013244, 0.017654] ms`, median `0.013244 ms`, correctness `PASSED=54/54`.
+- NCU Duration: 롤백 후 현재 accepted kernel 기준 `34.43 us`.
+- 남아있는 주요 bottleneck: accepted kernel NCU는 `Grid Size=1024`, `Waves/SM=0.77`, `Issue Slots Busy=16.96%`, `Memory Throughput=28.03%`, `DRAM Throughput=22.90%`, `L1/TEX Throughput=48.24%`, `L2 Throughput=19.07%`, `Achieved Occupancy=27.34%`, `Registers/thread=56`, local spilling `0`, `L1 hit=5.38%`, `L2 hit=1.49%`로 계속 small-grid / low-issue / low-occupancy / low-cache-hit 성격이다.
+- 이번에 시도했거나 검토했지만 안 좋다고 판단한 방향:
+  - 후보: `__reduce_add_sync(float)` 기반 warp reduction 교체.
+  - 안 좋은 이유: Modal의 현재 `tvm_ffi`/nvcc build path에서는 `__reduce_add_sync`가 `int`/`unsigned int` overload만 보여 `float` 인자에서 전 workload compile failure가 발생했다.
+  - 재시도 가능 조건: inline PTX `redux.sync.add.f32`를 직접 쓰거나, 다른 toolchain/헤더 조합에서 float overload 또는 생성 SASS를 확인할 수 있을 때.
+  - 후보: split-local `s_v` staging + `PreferredSharedMemoryCarveout=0`.
+  - 안 좋은 이유: shared load 양은 줄었지만 block barrier는 그대로였고, benchmark avg 5회가 모두 baseline(`0.012920 ms` median)보다 나빠졌다. B=64 workload `eaf0a285`도 `0.025133~0.029591 ms`로 baseline(`0.021~0.022 ms`)보다 느려졌다.
+  - 재시도 가능 조건: `__syncthreads()` 자체를 warp-local sync로 줄이거나, cluster/D5처럼 더 큰 중복 제거와 결합해서 barrier cost를 상쇄할 수 있을 때.
+- 다음 iteration 에서 시도할만한 후보 2~3 개:
+  - D5 CUDA Graph capture feasibility: 현재 목표(<0.009 ms)에는 launch overhead 제거가 benchmark median에 가장 직접적인 레버리지다.
+  - B1 2-CTA cluster q/k 공유: `V_PER_Q=2` 중복 q/k load를 줄이면서 split 증가 실패(R1)를 보완할 수 있다.
+  - G5 + inline PTX 검증: `redux.sync.add.f32`, `LDG/FFMA/SHFL` 비율, register 변화를 먼저 고정해서 실제 reduction 축소가 가능한 경로인지 확인.
