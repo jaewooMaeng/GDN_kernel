@@ -310,3 +310,18 @@ Key NCU fields to compare:
   - D5 CUDA Graph capture feasibility: avg latency 목표에는 launch overhead 제거가 가장 큰 레버리지. 포인터 안정성/graph update 가능성부터 확인 필요.
   - B1 2-CTA cluster q/k 공유: `V_PER_Q=2` 중복 q/k load를 줄이는 방향. cluster sync overhead와 TVM FFI launch attribute 리스크를 먼저 작게 검증.
   - G5 ptxas register/spill 및 SASS 확인: 현재 56 regs/thread, spill 0이지만 다음 구조 변경 전 기준선을 고정하고 `LDG/FFMA/SHFL` 비율을 확인.
+
+## iter #2
+
+- 적용한 최적화: E1 축소 버전. `q/k/v`를 block shared memory에 1회 staging하고, gate scalar(`g`, `beta`, `beta_g`)를 thread 0에서 한 번만 계산한 뒤 block 전체가 재사용하도록 수정. 첫 benchmark에서 regression 확인 후 즉시 롤백함.
+- 측정된 avg latency: 1회 `0.013278 ms`, correctness `PASSED=54/54`. Phase 3 기준선(`0.012920 ms` median)보다 명확히 느려 추가 4회 반복 없이 롤백.
+- NCU Duration: 롤백 후 현재 accepted kernel 기준 `32.48 us`.
+- 남아있는 주요 bottleneck: accepted kernel은 여전히 `Grid Size=1024`, `Waves/SM=0.77`, `Issue Slots Busy=18.00%`, `Memory Throughput=29.73%`, `DRAM Throughput=24.63%`, `L1/TEX Throughput=49.25%`, `L2 Throughput=20.21%`, `Achieved Occupancy=29.37%`, `Registers/thread=56`, local spilling `0`, `L1 hit=5.36%`, `L2 hit=1.48%`. small-grid / low-issue / low-occupancy 성격은 그대로다.
+- 이번에 시도했거나 검토했지만 안 좋다고 판단한 방향:
+  - 후보: E1 축소 버전 (`q/k/v` shared staging + gate block 1회 계산).
+  - 안 좋은 이유: block-invariant q/k/gate 중복은 줄였지만, 주병목인 state row streaming은 그대로였다. 대신 shared staging과 block-wide barrier cost가 추가되어 전체 avg가 `0.013278 ms`로 악화됐고, B=64 workload `eaf0a285`는 `0.024691 ms`로 baseline(`0.021~0.022 ms`)보다 느려졌다.
+  - 재시도 가능 조건: shared staging만으로는 재시도하지 않음. cluster로 q/k를 CTA 간 공유하거나, qk reduction 자체를 1회화하거나, async pipeline으로 state fetch overlap을 키우는 등 더 큰 구조적 중복 제거와 결합될 때만 재검토.
+- 다음 iteration 에서 시도할만한 후보 2~3 개:
+  - D5 CUDA Graph capture feasibility: kernel Duration보다 benchmark avg/median에 직접적인 레버리지가 큼. 포인터 안정성과 graph cache invalidation 규칙부터 확인.
+  - B1 2-CTA cluster q/k 공유: `V_PER_Q=2` 중복 q/k load를 줄이되, 단순 shared staging보다 큰 중복 제거를 노릴 수 있음.
+  - G5 + C2 묶음 검토: ptxas/SASS 기준선 확인 후 `__reduce_add_sync` 또는 동등한 warp-reduction 축소가 실제 hot loop shuffle 수를 줄일 수 있는지 검증.

@@ -266,7 +266,7 @@ setmaxnreg.inc.sync.aligned.u32 N / setmaxnreg.dec.sync.aligned.u32 N
 
 ### E. 공유 메모리 / 레지스터 재분배
 
-- [ ] **E1. q, k를 SMEM에 로드 후 block 내 broadcast**: 현재 128 lane이 독립 로드. Block 내 모든 warp가 동일 q/k 사용하므로 SMEM 1회 로드 + broadcast. Register 절약 → occupancy 향상 여지. SMEM bank broadcast는 conflict-free.
+- [ ] **E1. q, k를 SMEM에 로드 후 block 내 broadcast**: 현재 128 lane이 독립 로드. Block 내 모든 warp가 동일 q/k 사용하므로 SMEM 1회 로드 + broadcast. Register 절약 → occupancy 향상 여지. SMEM bank broadcast는 conflict-free. **[시도됨 iter #2, 후퇴]** q/k/v를 모두 shared에 staging하고 gate도 block당 1회만 계산하는 축소 버전을 시험했지만 avg latency가 `0.013278 ms`로 악화, B=64 workload `eaf0a285`가 `0.024691 ms`까지 상승. state row streaming이 주병목인 상태에서 shared staging과 block barrier 추가 이득보다 cost가 컸음.
 - [x] **E2. s_v → warp-register + sync 제거** [시도됨 Iter 1, 후퇴].
 - [ ] **E3. s_v를 warp 독립 register + `__shfl_sync` broadcast (sync 유지)**: E2와 구조 다름 — `__syncthreads()`는 유지하되 s_v shared 대신 warp 내 register + shuffle. 구조 차이로 재시도 가치 있음.
 - [ ] **E4. k_vals/q_vals를 SMEM에 staging → ldmatrix.sync.aligned**: Tensor Core 도입(J1) 전 단계로도 유용. `ldmatrix.x4.m8n8.shared.b16` 로 16-bit 텐서 레지스터 분산 로드 실험.
@@ -404,10 +404,13 @@ B200 SM ≈ 148:
 | 19 | B≤16 split=8 | 0.014 | 롤백 |
 | 20 ✅✅✅ | **gate lane 0 + shfl broadcast** | **0.010 best / 0.012 median** | **Phase 2 달성** |
 | R1 | B≥32 split=4로 grid 2배 확대 | 0.012920 median | 롤백 |
+| R2 | q/k/v shared staging + gate block 1회 계산 | 0.013278 avg | 롤백 |
 
 **핵심 인사이트 (Iter 20)**: 32 lanes 동시 exp/log1p → SFU throughput 심각 경쟁. Lane 0 전담 + 3 shuffle로 SFU 경쟁 완전 제거 = Phase 2 break-through.
 
 **R1 인사이트**: B=64의 `waves/SM` 부족을 단순 split 증가로 해결하려 했지만 B=64 latency가 기존 `0.021~0.022 ms`에서 `0.024~0.029 ms`로 악화. grid 증가만으로는 부족하고 q/k/v/gate 중복 제거 또는 launch overhead 제거가 필요.
+
+**R2 인사이트**: block-invariant q/k/gate 중복 자체는 존재하지만, q/k/v를 shared에 올리는 축소형 E1은 현재 커널의 핵심 비용인 state row streaming을 줄이지 못했다. 반대로 shared scalar load와 block-wide barrier만 늘어나 B=64가 `0.024691 ms`로 악화됐다. 같은 계열은 cluster 공유나 qk reduction 1회화처럼 더 큰 중복 제거가 동반될 때만 재검토한다.
 
 ### Phase 3+ 기록 템플릿
 
