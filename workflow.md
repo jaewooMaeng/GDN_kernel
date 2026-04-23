@@ -313,7 +313,7 @@ setmaxnreg.inc.sync.aligned.u32 N / setmaxnreg.dec.sync.aligned.u32 N
 - [ ] **H1. `cp.async.ca.shared.global` 기반 state row prefetch**: register pipeline을 SMEM async pipeline으로. 16B-align 128B row → async SMEM. Compute ↔ load overlap.
 - [ ] **H2. `cuda::pipeline<thread_scope_block, 3>` + `cuda::memcpy_async`** (B2 재차): H1의 high-level 래퍼. `cuda::aligned_size_t<16>`으로 TMA path. API 안정성 ○.
 - [ ] **H3. TMA tensor map (host 1회 생성)**: `cuTensorMapEncodeTiled`로 state tensor map 생성 → 커널 내 `cp.async.bulk.tensor.1d`. 주소 계산 HW offload. Host wrapper 변경 필요.
-- [ ] **H4. `__pipeline_memcpy_async` 저수준**: high-level API가 LDGSTS 생성 보장 약할 때 PTX 수준 primitive.
+- [ ] **H4. `__pipeline_memcpy_async` 저수준**: high-level API가 LDGSTS 생성 보장 약할 때 PTX 수준 primitive. **[시도됨 iter #5, 후퇴]** `ROWS_PER_WARP=16` 경로에 warp-private 2-stage 4-row staging을 넣고 `sm_100a` JIT flags까지 명시했지만 full benchmark avg가 `0.013124 ms`로 baseline `0.012920 ms`보다 악화, B=64 `eaf0a285`도 `0.024348 ms`로 baseline(`0.021~0.022 ms`)보다 느려졌다. 현재 형태의 per-thread async copy + shared reload은 재시도하지 않음.
 - [ ] **H5. `mbarrier` 기반 async barrier**: `__syncthreads()` 대체 가능 구간.
 
 ---
@@ -408,6 +408,7 @@ B200 SM ≈ 148:
 | R2 | q/k/v shared staging + gate block 1회 계산 | 0.013278 avg | 롤백 |
 | R3 | split-local `s_v` staging + carveout=0 (`__reduce_add_sync(float)`는 build blocked) | 0.013244 median | 롤백 |
 | R4 | `kernel.cu` host launch path 수동 CUDA Graph replay | 0.014014 avg / 0.017512 retry | 롤백 |
+| R5 | RPW=16 warp-private `__pipeline_memcpy_async` + `sm_100a` JIT flags | 0.013124 avg | 롤백 |
 
 **핵심 인사이트 (Iter 20)**: 32 lanes 동시 exp/log1p → SFU throughput 심각 경쟁. Lane 0 전담 + 3 shuffle로 SFU 경쟁 완전 제거 = Phase 2 break-through.
 
@@ -418,6 +419,8 @@ B200 SM ≈ 148:
 **R3 인사이트**: block이 실제로 쓰는 `v` row만 shared에 적재하고 `PreferredSharedMemoryCarveout=0`를 줘도 benchmark는 개선되지 않았다. 5회 avg가 `[0.012954, 0.013378, 0.013142, 0.013244, 0.017654] ms`로 튀었고 median이 `0.013244 ms`까지 악화됐다. `__reduce_add_sync(float)`도 현재 build path에서 바로 쓸 수 없었으므로, 다음에는 launch overhead 제거(D5)나 CTA 간 q/k 공유(B1)처럼 더 큰 구조적 중복 제거를 우선한다.
 
 **R4 인사이트**: CUDA Graph 자체의 잠재 이득은 크지만, 현재 flashinfer-bench isolated runner + TVM FFI wrapper 경로에서는 graph instantiate/update 오버헤드가 초소형 decode launch savings를 상쇄했다. 첫 full benchmark avg가 `0.014014 ms`, update 생략 캐시를 넣은 retry도 `0.017512 ms`로 더 악화됐고, B=64 workload `eaf0a285`는 `0.030310 ms`, `0.031475 ms`까지 후퇴했다. 같은 경로에서는 D5를 접고, 다음에는 kernel body duration을 직접 줄일 수 있는 B1/H2 계열을 우선한다.
+
+**R5 인사이트**: `ROWS_PER_WARP=16` large-batch 경로만 골라 warp-private `__pipeline_memcpy_async` 2-stage prefetch를 넣어도 benchmark는 개선되지 않았다. correctness는 유지됐지만 full benchmark avg가 `0.013124 ms`로 baseline `0.012920 ms`보다 느려졌고, B=64 `eaf0a285`도 `0.024348 ms`로 후퇴했다. per-thread async copy + shared reload + commit/wait overhead가 기존 register prefetch보다 비싸서 overlap 이득을 상쇄한 것으로 보인다. 다음 async 계열 재시도는 block/warp 단위 `cuda::pipeline` 또는 `cp.async`로 bytes-in-flight를 더 키우거나, B1처럼 중복 q/k work 제거와 결합할 때만 검토한다.
 
 ### Phase 3+ 기록 템플릿
 

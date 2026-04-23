@@ -358,3 +358,21 @@ Key NCU fields to compare:
   - B1 2-CTA cluster q/k 공유: `V_PER_Q=2` 중복 q/k load를 줄이면서 kernel body Duration 자체를 줄이는 방향.
   - H1/H2 async state-row prefetch (`cp.async` / `cuda::memcpy_async`): low issue / low bytes-in-flight 문제를 직접 건드릴 수 있음.
   - G5 + SASS/ptxas 기준선 재고정: `Registers/thread=56`, spill 0 상태에서 `LDG/FFMA/SHFL` 비율과 hot loop instruction mix를 확인해 다음 구조 변경 리스크를 줄일 것.
+
+## iter #5
+
+- 적용한 최적화: H4 변형. `ROWS_PER_WARP=16` large-batch 경로만 대상으로 warp-private 2-stage `__pipeline_memcpy_async` state-row prefetch를 넣고, `decode_submit_entry.py`의 TVM FFI JIT path에 `-arch=sm_100a`, `-Xptxas -v`, `-Xptxas -warn-spills`를 명시했다. full benchmark regression으로 전체 롤백함.
+- 측정된 avg latency: 1회 `0.013124 ms`, correctness `PASSED=54/54`. Phase 3+는 5회 median 판정이 원칙이지만, accepted baseline(`0.012920 ms` median)보다 명확히 느려 workflow의 즉시 롤백 규칙에 따라 추가 4회 반복 없이 중단했다. 롤백 후 accepted latency는 `0.012920 ms`를 유지한다.
+- NCU Duration: 롤백 후 현재 accepted kernel 기준 `32.83 us`.
+- 남아있는 주요 bottleneck: rollback 후 profiled kernel은 `Grid Size=1024`, `Waves/SM=0.77`, `Issue Slots Busy=18.00%`, `Memory Throughput=29.76%`, `DRAM Throughput=24.09%`, `L1/TEX Throughput=48.44%`, `L2 Throughput=19.96%`, `Achieved Occupancy=28.79%`, `Registers/thread=56`, local spilling `0`, `L1 hit=5.37%`, `L2 hit=1.51%`다. 여전히 single-pipeline 포화가 아니라 small-grid / low-issue / register-limited occupancy / poor-cache-hit 성격이 강하다.
+- 이번에 시도했거나 검토했지만 안 좋다고 판단한 방향:
+  - 후보: H4 `ROWS_PER_WARP=16` warp-private `__pipeline_memcpy_async` + `sm_100a` JIT flags.
+  - 안 좋은 이유: correctness는 유지됐지만 full benchmark avg가 `0.013124 ms`로 baseline `0.012920 ms`보다 악화됐다. B=64 workload `eaf0a285`도 `0.024348 ms`로 baseline(`0.021~0.022 ms`)보다 느려졌다. per-thread async copy 후 shared reload와 commit/wait overhead가 기존 register prefetch 대비 더 컸고, overlap 이득을 상쇄한 것으로 보인다.
+  - 재시도 가능 조건: block/warp 단위 `cuda::pipeline` 또는 `cp.async`로 multiple stages를 더 깊게 유지해 bytes-in-flight를 실제로 늘리거나, B1처럼 q/k 중복 제거와 결합해 per-block duplicated work도 함께 줄일 수 있을 때. 현재의 per-thread 2-stage 4-row staging 단독안은 재시도하지 않음.
+  - 후보: C2 `__reduce_add_sync(float)` / `redux.sync.add.f32`.
+  - 안 좋은 이유: 공식 CUDA Programming Guide/PTX ISA 기준 하드웨어 warp reduce는 여전히 `int`/`unsigned` 계열만 문서화되어 있어, iter #3의 build blocked 이유가 이번에도 해소되지 않았다.
+  - 재시도 가능 조건: 공식 문서 또는 검증된 SASS 경로에서 float reduce 지원이 확인되거나, 다른 합리적 구현 경로가 생길 때.
+- 다음 iteration 에서 시도할만한 후보 2~3 개:
+  - B1 2-CTA cluster q/k 공유: `V_PER_Q=2` 중복 q/k read와 qk_dot 중복을 줄이면서 kernel body Duration 자체를 줄이는 방향.
+  - A2/A3 저위험 메모리 힌트 (`cuda::annotated_ptr`, read-only load path 확인): shared-memory 구조 변경 없이 state read path를 다듬는 방향.
+  - G5 + SASS/ptxas 기준선 재고정: accepted kernel의 `Registers/thread=56`, spill 0, `LDG/FFMA/SHFL` 비율을 먼저 고정해 다음 구조 변경 리스크를 낮출 것.

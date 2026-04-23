@@ -1,0 +1,57 @@
+✓ Initialized. View run at 
+https://modal.com/apps/kjms2026/main/ap-cITLlx7zYIXuJo8cov6gUo
+✓ Created objects.
+├── 🔨 Created mount /Users/jaewoo/SAIT/FlashInfer 
+│   Challenge/mlsys26-final-decode/scripts/run_modal.py
+└── 🔨 Created function run_benchmark.
+[2026-04-24T03:05:32] Packing solution from source files...
+Solution packed: /Users/jaewoo/SAIT/FlashInfer Challenge/mlsys26-final-decode/solution.json
+  Name: gdn-decode-v2
+  Definition: gdn_decode_qk4_v8_d128_k_last
+  Author: MSInfer
+  Config language: cuda
+  Runtime language: python
+  Source files: ['kernel.cu', 'decode_submit_entry.py']
+[2026-04-24T03:05:32] Validating solution JSON...
+[2026-04-24T03:05:32] Loaded solution gdn-decode-v2 (gdn_decode_qk4_v8_d128_k_last) in 0.01s
+[2026-04-24T03:05:32] Quick mode enabled: warmup_runs=1, iterations=1, num_trials=1, use_isolated_runner=False
+[2026-04-24T03:05:32] Dispatching benchmark to Modal B200...
+[2026-04-24T03:05:32] Workload UUID filter enabled: eaf0a285
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 13.0.2
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+[2026-04-23T18:05:52] Remote benchmark start: solution=gdn-decode-v2, definition=gdn_decode_qk4_v8_d128_k_last
+[2026-04-23T18:05:52] BenchmarkConfig(warmup_runs=1, iterations=1, num_trials=1)
+[2026-04-23T18:05:52] Decode path mode=auto
+[2026-04-23T18:05:52] Loading trace set from /data/data/mlsys26-contest
+[2026-04-23T18:05:53] Loaded trace set in 0.57s
+[2026-04-23T18:05:53] Running benchmark across 1 workloads
+[2026-04-23T18:05:58] Benchmark completed in 5.48s
+[2026-04-23T18:05:58] Decode paths observed: unavailable (external target only or no wrapper logging)
+[2026-04-23T18:05:58] Remote benchmark finished in 6.05s
+[2026-04-24T03:05:59] Received benchmark results in 26.45s
+
+gdn_decode_qk4_v8_d128_k_last:
+  workloads: 1
+  status counts: PASSED=1
+  avg latency: 26.304 µs (0.026304 ms)
+  avg speedup: 1504.02x
+  worst abs error: 1.91e-06
+  worst rel error: 3.11e-02
+  Workload eaf0a285...: PASSED | 26.304 µs (0.026304 ms) | 1504.02x speedup | abs_err=1.91e-06, rel_err=3.11e-02
+[2026-04-24T03:05:59] Local entrypoint finished in 26.46s
+Stopping app - local entrypoint completed.
+✓ App completed. View run at 
+https://modal.com/apps/kjms2026/main/ap-cITLlx7zYIXuJo8cov6gUo
