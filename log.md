@@ -343,3 +343,18 @@ Key NCU fields to compare:
   - D5 CUDA Graph capture feasibility: 현재 목표(<0.009 ms)에는 launch overhead 제거가 benchmark median에 가장 직접적인 레버리지다.
   - B1 2-CTA cluster q/k 공유: `V_PER_Q=2` 중복 q/k load를 줄이면서 split 증가 실패(R1)를 보완할 수 있다.
   - G5 + inline PTX 검증: `redux.sync.add.f32`, `LDG/FFMA/SHFL` 비율, register 변화를 먼저 고정해서 실제 reduction 축소가 가능한 경로인지 확인.
+
+## iter #4
+
+- 적용한 최적화: D5 수동 CUDA Graph replay. `solution/cuda/kernel.cu`의 host launch path에 variant별 graph exec cache를 추가해 normal launch 대신 `cudaGraphLaunch`를 쓰도록 했고, 2차 시도에서는 동일 workload 반복 시 `cudaGraphExecKernelNodeSetParams`를 건너뛰는 캐시도 넣었다. 두 시도 모두 benchmark regression으로 전체 롤백함.
+- 측정된 avg latency: 1차 `0.014014 ms`, retry `0.017512 ms`, correctness `PASSED=54/54`. Phase 3+는 원칙적으로 5회 median 판정이지만, 둘 다 accepted baseline(`0.012920 ms` median)보다 명확히 느려 workflow의 즉시 롤백 규칙에 따라 추가 5회 측정 없이 중단했다. 롤백 후 accepted latency는 `0.012920 ms`를 유지한다.
+- NCU Duration: 롤백 후 현재 accepted kernel 기준 `32.64 us`.
+- 남아있는 주요 bottleneck: rollback 후 profiled kernel은 여전히 `Grid Size=1024`, `Waves/SM=0.77`, `Issue Slots Busy=17.82%`, `Memory Throughput=29.37%`, `DRAM Throughput=24.21%`, `L1/TEX Throughput=48.81%`, `L2 Throughput=20.11%`, `Achieved Occupancy=29.36%`, `Registers/thread=56`, local spilling `0`, `L1 hit=5.37%`, `L2 hit=1.48%`다. single-pipeline 포화가 아니라 small-grid / low-issue / low-occupancy / poor-cache-hit 성격이 계속된다.
+- 이번에 시도했거나 검토했지만 안 좋다고 판단한 방향:
+  - 후보: D5 `kernel.cu` wrapper 내부 수동 CUDA Graph replay.
+  - 안 좋은 이유: 현재 flashinfer-bench isolated runner + TVM FFI 경로에서는 graph instantiate/update 관리 비용이 초소형 decode launch savings를 상쇄했다. 첫 full benchmark avg가 `0.014014 ms`, update 생략 캐시를 넣은 retry도 `0.017512 ms`로 더 악화됐고, B=64 workload `eaf0a285`는 각각 `0.030310 ms`, `0.031475 ms`까지 후퇴했다.
+  - 재시도 가능 조건: graph를 kernel wrapper 내부가 아니라 benchmark/harness 상위 반복 루프에서 한 번 캡처해 여러 decode call에 재사용할 수 있거나, stable buffer/process reuse가 보장되어 instantiate/update 비용이 측정 구간 밖으로 빠질 때.
+- 다음 iteration 에서 시도할만한 후보 2~3 개:
+  - B1 2-CTA cluster q/k 공유: `V_PER_Q=2` 중복 q/k load를 줄이면서 kernel body Duration 자체를 줄이는 방향.
+  - H1/H2 async state-row prefetch (`cp.async` / `cuda::memcpy_async`): low issue / low bytes-in-flight 문제를 직접 건드릴 수 있음.
+  - G5 + SASS/ptxas 기준선 재고정: `Registers/thread=56`, spill 0 상태에서 `LDG/FFMA/SHFL` 비율과 hot loop instruction mix를 확인해 다음 구조 변경 리스크를 줄일 것.

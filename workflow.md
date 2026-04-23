@@ -254,9 +254,10 @@ setmaxnreg.inc.sync.aligned.u32 N / setmaxnreg.dec.sync.aligned.u32 N
 - [x] **D2. Block size 128 통일** [적용됨 Iter 8].
 - [x] **D3. `__launch_bounds__(128, 9)`** [적용됨 Iter 17].
 - [ ] **D4. Split factor 추가 세분화**: B≤4:8, B≤16:4, B≥32:2 등 3~4단계로 확장. outlier batch(B=8, 16, 32)에서 효과 검증. 특히 B=32가 경계이므로 B=24, 48 등 중간 실험 가치. **[시도됨 iter #1 일부, 후퇴]** B≥32를 단순히 split=4로 올리는 실험은 median 0.012920 ms로 롤백. q/k/v/gate 중복과 per-block ILP 감소가 더 커 보이므로 같은 방식 재시도 금지.
-- [ ] **D5. CUDA Graph capture (host-side)** ★ **Phase 4 최대 돌파구 후보** ★: `cudaStreamBeginCapture/EndCapture`로 decode call 그래프화. launch overhead 2~5 μs → ~60 ns/node. 10μs 타겟에서 **결정적 효과**.
+- [ ] **D5. CUDA Graph capture (host-side)** ★ **Phase 4 최대 돌파구 후보** ★: `cudaStreamBeginCapture/EndCapture`로 decode call 그래프화. launch overhead 2~5 μs → ~60 ns/node. 10μs 타겟에서 **결정적 효과**. **[시도됨 iter #4, 후퇴]** `kernel.cu` host launch path에 수동 graph exec cache를 넣었지만 현재 flashinfer-bench isolated runner + TVM FFI 경로에서는 avg latency가 `0.014014 ms`, retry `0.017512 ms`로 baseline(`0.012920 ms` median)보다 명확히 악화됐다. workload별 graph instantiate/update 비용이 launch 절감 이득을 넘은 것으로 보이며, **같은 경로에서는 재시도 금지**.
   - 단계: (1) `scripts/run_modal.py`에서 bench 반복 루프 구조 확인 → graph capture/replay 허용 여부 판단. (2) 허용 시 host wrapper에 `cudaGraph_t`, `cudaGraphExec_t` 추가. (3) 첫 호출은 capture, 이후는 `cudaGraphLaunch`.
   - 제약: 입력 텐서 주소가 매번 동일해야 함 (또는 `cudaGraphExecUpdate` 사용).
+  - 재시도 가능 조건: graph를 kernel wrapper 내부가 아니라 benchmark/harness 상위 반복 루프에서 한 번 캡처해 여러 decode call에 재사용할 수 있거나, stable buffer/process reuse가 보장되어 instantiate/update가 측정 구간 밖으로 빠질 때.
   - Framework 제약으로 불가한 경우 D6 대체.
 - [ ] **D6. Persistent kernel + cooperative groups**: `cudaLaunchCooperativeKernel`. 단일 launch에서 모든 (batch, head, split) work를 grid-stride로 처리. Launch overhead 완전 제거. 구현 난이도 상.
 - [ ] **D7. Stream priority 최고**: `cudaStreamCreateWithPriority`. Modal 환경에 concurrent work 있을 때 효과.
@@ -406,6 +407,7 @@ B200 SM ≈ 148:
 | R1 | B≥32 split=4로 grid 2배 확대 | 0.012920 median | 롤백 |
 | R2 | q/k/v shared staging + gate block 1회 계산 | 0.013278 avg | 롤백 |
 | R3 | split-local `s_v` staging + carveout=0 (`__reduce_add_sync(float)`는 build blocked) | 0.013244 median | 롤백 |
+| R4 | `kernel.cu` host launch path 수동 CUDA Graph replay | 0.014014 avg / 0.017512 retry | 롤백 |
 
 **핵심 인사이트 (Iter 20)**: 32 lanes 동시 exp/log1p → SFU throughput 심각 경쟁. Lane 0 전담 + 3 shuffle로 SFU 경쟁 완전 제거 = Phase 2 break-through.
 
@@ -414,6 +416,8 @@ B200 SM ≈ 148:
 **R2 인사이트**: block-invariant q/k/gate 중복 자체는 존재하지만, q/k/v를 shared에 올리는 축소형 E1은 현재 커널의 핵심 비용인 state row streaming을 줄이지 못했다. 반대로 shared scalar load와 block-wide barrier만 늘어나 B=64가 `0.024691 ms`로 악화됐다. 같은 계열은 cluster 공유나 qk reduction 1회화처럼 더 큰 중복 제거가 동반될 때만 재검토한다.
 
 **R3 인사이트**: block이 실제로 쓰는 `v` row만 shared에 적재하고 `PreferredSharedMemoryCarveout=0`를 줘도 benchmark는 개선되지 않았다. 5회 avg가 `[0.012954, 0.013378, 0.013142, 0.013244, 0.017654] ms`로 튀었고 median이 `0.013244 ms`까지 악화됐다. `__reduce_add_sync(float)`도 현재 build path에서 바로 쓸 수 없었으므로, 다음에는 launch overhead 제거(D5)나 CTA 간 q/k 공유(B1)처럼 더 큰 구조적 중복 제거를 우선한다.
+
+**R4 인사이트**: CUDA Graph 자체의 잠재 이득은 크지만, 현재 flashinfer-bench isolated runner + TVM FFI wrapper 경로에서는 graph instantiate/update 오버헤드가 초소형 decode launch savings를 상쇄했다. 첫 full benchmark avg가 `0.014014 ms`, update 생략 캐시를 넣은 retry도 `0.017512 ms`로 더 악화됐고, B=64 workload `eaf0a285`는 `0.030310 ms`, `0.031475 ms`까지 후퇴했다. 같은 경로에서는 D5를 접고, 다음에는 kernel body duration을 직접 줄일 수 있는 B1/H2 계열을 우선한다.
 
 ### Phase 3+ 기록 템플릿
 
@@ -460,6 +464,6 @@ B200 SM ≈ 148:
 - **개선 < 0.001 ms**: 소규모 최적화 조합 고려. 단독으로는 판단 어려움.
 - **누적**: 성공한 최적화 위에 다음을 쌓는다.
 - **Phase 3 돌파 추천 순서**: G5 (spill 분석) → A2 (annotated_ptr) → A3/A4 (ldg/nc) → G4 (sm_100a 확인) → C2 (reduce_add_sync) → I1 (L2 warmup). 구현 난이도 낮은 것부터.
-- **Phase 4 돌파 추천 순서**: D5 (CUDA Graph, **host만 수정**) → B1 (2-CTA cluster) → B2/H2 (async pipeline) → B5 (warp specialization). D5가 가장 레버리지 높음.
+- **Phase 4 돌파 추천 순서**: B1 (2-CTA cluster) → B2/H2 (async pipeline) → B5 (warp specialization) → D5 (단, graph를 wrapper 바깥 반복 루프에서 재사용할 수 있을 때만). 현재 harness 경로에선 D5가 bad direction이었다.
 - **10회 이상 답보**: `ncu --set full` + `cuobjdump --dump-sass` 로 병목 재확인 (`smsp__inst_executed_pipe_*`, `smsp__warp_issue_stalled_*`, SASS 내 FFMA/LDG/SHFL 비율). 사용자에게 결과 공유.
 - `modal run` 컴파일 에러 즉시 해결. `-Xptxas -v` 출력은 매 변경 후 확인 (register/spill 추적).
