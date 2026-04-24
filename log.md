@@ -501,3 +501,18 @@ Key NCU fields to compare:
   - A3/A4 read-only load path 검증 (`__ldg`, `ld.global.nc.v4.f32`) + SASS 확인.
   - B1 변형: q/k global/reduction 중복을 더 직접적으로 줄이는 구조적 안만 제한적으로 재검토.
   - G5를 benchmark path 밖 standalone build/objdump 경로로 분리해 `56 regs`, spill `0`, load opcode 사실관계를 먼저 고정.
+
+## iter #4 (2026-04-24 codex)
+
+- 적용한 최적화: 승인안 A12 단독. `gdn_decode_kernel<4>`에서 dead prefetch였던 `next_a..d` 초기 load/rotate를 없애기 위해 `state_prefetch<4>` 특수화를 추가했다. 의도상 `RPW=8/16`의 수학식과 store path는 건드리지 않았다.
+- 측정된 latency: 패킹은 성공했다. representative subset 스크리닝으로 `modal run scripts/run_modal.py --quick --max-workloads 3`를 먼저 실행했고 결과는 `PASSED=3/3`, `avg latency = 0.028053 ms`였다. 이어 `eaf0a285` decision gate(`modal run scripts/run_modal.py --decision-gate --workload-uuid-prefixes eaf0a285`)는 `PASSED`, `avg latency = 0.029683 ms`였다.
+- full benchmark / NCU: approved PM gate 기준으로 핵심 B=64 workload가 recent accepted band(`~0.021~0.024 ms`)보다 명확히 느려 full benchmark 5회 median과 NCU profiling은 생략했다. `solution/cuda/kernel.cu`는 백업본으로 즉시 복원했다.
+- 판정: `ROWS_PER_WARP=4` dead-prefetch 제거 helperization 버전은 채택하지 않는다. `ralph_state/latest_latency.txt`는 이번 gate 수치 `0.029683`으로 갱신했고, 새 NCU가 없어 `ralph_state/latest_ncu_duration_us.txt`는 유지했다.
+- 이번에 시도했거나 검토했지만 안 좋다고 판단한 방향:
+  - 후보: `state_prefetch<4>` 특수화 기반 `RPW=4` 전용 dead prefetch 제거.
+  - 안 좋은 이유: small-batch path만 줄이려는 의도였지만 representative subset과 B=64 guard가 모두 악화됐다. source-level로 `RPW=8/16` 산술을 안 건드렸어도 helperization이 large-batch codegen을 흔들었을 가능성을 배제할 수 없다.
+  - 재시도 가능 조건: 다음에는 `gdn_decode_kernel<8/16>` 경로가 byte-for-byte 동일하거나 SASS가 동일하다는 증거를 먼저 확보하거나, 아예 small-batch 전용 dispatch/translation unit으로 물리적으로 분리해 검증할 때만 다시 본다.
+- 다음 iteration 에서 시도할만한 후보 2~3 개:
+  - A3/A4 read-only state load path 검증 (`__ldg`, `ld.global.nc.v4.f32`) + SASS 확인: helperization보다 load opcode 변화가 실제로 보이는 방향.
+  - A5 standalone `missProp=Streaming`: kernel body 무변경 host-side 실험으로 좁게 확인.
+  - small-batch 전용 분리 검증: `RPW=4` 계열을 다시 볼 거면 large-batch codegen 무변경을 먼저 증명할 수 있는 빌드/objdump 경로를 준비할 것.
