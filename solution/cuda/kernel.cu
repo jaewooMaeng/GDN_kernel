@@ -117,6 +117,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 9) gdn_decode_kernel(
     const int vi_start = split_id * ROWS_PER_BLOCK + warp_id * ROWS_PER_WARP;
     const int lane4 = lane << 2;
 
+    // B2: Enhanced prefetch with single-step lookahead (original pattern with larger prefetch)
     float4 pf_a = __ldg(reinterpret_cast<const float4*>(state_base + vi_start * HEAD_DIM + lane4));
     float4 pf_b = __ldg(reinterpret_cast<const float4*>(state_base + (vi_start + 1) * HEAD_DIM + lane4));
     float4 pf_c = __ldg(reinterpret_cast<const float4*>(state_base + (vi_start + 2) * HEAD_DIM + lane4));
