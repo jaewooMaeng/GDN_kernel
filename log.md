@@ -549,3 +549,11 @@ Key NCU fields to compare:
   - A3/A4 read-only load path 검증 (`__ldg`, `ld.global.nc.v4.f32`) + SASS 확인: 실제 state/qk load opcode 변화가 보이는 방향만 시도.
   - benchmark path 밖 codegen 기준선 재확인: standalone build/objdump로 accepted `gdn_decode_kernel<8>`의 `56 regs`, spill `0`, load opcode를 먼저 고정.
   - offline 기준선 확보 후 `q/k` read-only path 재검토: state가 아니라 `q/k` plain global load 쪽에만 좁혀 leverage를 확인.
+
+## iter #7 (2026-04-24 codex)
+
+- 적용한 최적화: 승인안 A3 `q/k` only `__ldg` read-only load 단독안. `solution/cuda/kernel.cu:84-106`의 `q/k` packed `uint2` load 두 군데만 helper로 치환했고, state load helper / hot loop / `s_v` barrier / split policy / `launch_bounds` / L2 persistence는 유지했다.
+- offline SASS gate: 로컬 macOS 환경은 `CUDA_HOME` 부재로 `tvm_ffi.cpp.load` standalone build가 불가능해, 대신 Modal CUDA 13.0 helper에서 baseline/current를 각각 build + `cuobjdump`로 비교했다. 세 instantiation(`gdn_decode_kernel<4/8/16>`) 모두 resource usage가 baseline/current 동일하게 `REG:56`, spill `0`, shared `1536 B`였고, 관련 load opcode도 baseline/current 모두 `LDG.E.64.CONSTANT` / `LDG.E.U16.CONSTANT`로 같았다. 즉 `__ldg` 치환은 current Blackwell codegen에서 `q/k` path를 실제로 바꾸지 못했다.
+- benchmark / NCU: 승인 플랜의 veto 조건("opcode 변화가 없거나 register가 `56`을 넘으면 pack/bench를 하지 않는다")에 걸려 `/opt/homebrew/Caskroom/miniforge/base/envs/fi-bench/bin/python scripts/pack_solution.py`, `/opt/homebrew/Caskroom/miniforge/base/envs/fi-bench/bin/modal run scripts/run_modal.py`, NCU profiling은 모두 생략했다. `solution/cuda/kernel.cu`는 즉시 원상복구했다.
+- 판정: A3 `q/k` only `__ldg` 안은 이번 iteration에서 채택하지 않는다.
+- 다음 iteration 메모: read-only intent만으로는 source-level helper가 SASS를 못 바꾸므로, 다음 메모리 계열은 후보 2였던 `q/k` only inline PTX `ld.global.nc`처럼 opcode를 명시적으로 강제하는 안만 검토하는 편이 낫다.

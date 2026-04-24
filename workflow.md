@@ -456,6 +456,8 @@ B200 SM ≈ 148:
 
 **R16 인사이트**: `setup_l2_persistence()`의 `missProp`만 `Streaming`으로 바꾸는 standalone soft L2 policy 안도 benchmark를 크게 악화시켰다. full benchmark avg가 `0.016806 ms`, 핵심 B=64 `eaf0a285`가 `0.026108 ms`로 recent accepted band를 명확히 넘었고, rollback 후 baseline NCU도 `gdn_decode_kernel<8>`, `Duration=31.46 us`, `Issue Slots Busy=21.73%`, `Achieved Occupancy=39.79%`, `Registers/thread=56`, `L1 hit=7.86%`, `L2 hit=1.76%`로 근본 병목이 그대로였다. host-side cache policy 단독안은 우선순위를 낮추고, 다음 메모리 계열은 실제 load opcode 변화(A3/A4)나 offline codegen/SASS 기준선 확보 후의 `q/k` path 검토처럼 codegen 사실이 보이는 방향으로만 좁힌다.
 
+**R17 인사이트**: 승인안 A3 `q/k` only `__ldg`는 Modal CUDA 13.0 standalone build/`cuobjdump` 기준 baseline/current의 `gdn_decode_kernel<4/8/16>` resource usage가 모두 `REG:56`, spill `0`, shared `1536 B`로 같았고, 관련 load opcode도 `LDG.E.64.CONSTANT` / `LDG.E.U16.CONSTANT`로 동일해 사실상 no-op였다. 다음 iteration의 메모리 계열은 source-level `__ldg` helper 재시도 대신 `q/k` only inline PTX `ld.global.nc`처럼 opcode를 명시적으로 강제하는 안으로 넘어간다.
+
 ### Phase 3+ 기록 템플릿
 
 ```
