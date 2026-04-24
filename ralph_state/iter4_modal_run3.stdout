@@ -1,0 +1,108 @@
+✓ Initialized. View run at 
+https://modal.com/apps/kjms2026/main/ap-YesDVRSBEJOccHFrHZC5On
+✓ Created objects.
+├── 🔨 Created mount /Users/jaewoo/SAIT/FlashInfer 
+│   Challenge/mlsys26-final-decode/scripts/run_modal.py
+└── 🔨 Created function run_benchmark.
+[2026-04-24T12:01:12] Packing solution from source files...
+Solution packed: /Users/jaewoo/SAIT/FlashInfer Challenge/mlsys26-final-decode/solution.json
+  Name: gdn-decode-v2
+  Definition: gdn_decode_qk4_v8_d128_k_last
+  Author: MSInfer
+  Config language: cuda
+  Runtime language: python
+  Source files: ['kernel.cu', 'decode_submit_entry.py']
+[2026-04-24T12:01:12] Validating solution JSON...
+[2026-04-24T12:01:12] Loaded solution gdn-decode-v2 (gdn_decode_qk4_v8_d128_k_last) in 0.01s
+[2026-04-24T12:01:12] Dispatching benchmark to Modal B200...
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 13.0.2
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+[2026-04-24T03:01:29] Remote benchmark start: solution=gdn-decode-v2, definition=gdn_decode_qk4_v8_d128_k_last
+[2026-04-24T03:01:29] BenchmarkConfig(warmup_runs=1, iterations=5, num_trials=3)
+[2026-04-24T03:01:29] Decode path mode=auto
+[2026-04-24T03:01:29] Loading trace set from /data/data/mlsys26-contest
+[2026-04-24T03:01:30] Loaded trace set in 0.52s
+[2026-04-24T03:01:30] Running benchmark across 54 workloads
+[2026-04-24T03:05:31] Benchmark completed in 240.81s
+[2026-04-24T03:05:31] Decode paths observed: unavailable (external target only or no wrapper logging)
+[2026-04-24T12:05:31] Received benchmark results in 258.86s
+
+gdn_decode_qk4_v8_d128_k_last:
+  workloads: 54
+  status counts: PASSED=54
+  avg latency: 13.102 µs (0.013102 ms)
+  avg speedup: 967.85x
+  worst abs error: 3.05e-05
+  worst rel error: 3.93e-01
+  Workload 901e5104...: PASSED | 9.327 µs (0.009327 ms) | 87.09x speedup | abs_err=5.96e-08, rel_err=2.85e-03
+  Workload a5714b69...: PASSED | 10.278 µs (0.010278 ms) | 74.44x speedup | abs_err=3.73e-08, rel_err=2.52e-02
+  Workload 3daa0974...: PASSED | 9.730 µs (0.009730 ms) | 77.99x speedup | abs_err=7.45e-09, rel_err=4.14e-03
+  Workload 22d5cef5...: PASSED | 9.527 µs (0.009527 ms) | 81.05x speedup | abs_err=8.94e-08, rel_err=7.46e-03
+  Workload aed4bdd4...: PASSED | 9.658 µs (0.009658 ms) | 78.89x speedup | abs_err=1.49e-08, rel_err=4.19e-03
+  Workload 49a125e5...: PASSED | 9.470 µs (0.009470 ms) | 81.89x speedup | abs_err=8.94e-08, rel_err=3.83e-03
+  Workload 798635cf...: PASSED | 9.410 µs (0.009410 ms) | 81.12x speedup | abs_err=1.19e-07, rel_err=1.87e-03
+  Workload 5716e24a...: PASSED | 9.621 µs (0.009621 ms) | 79.03x speedup | abs_err=2.24e-07, rel_err=8.30e-04
+  Workload 4c7df22f...: PASSED | 9.651 µs (0.009651 ms) | 79.86x speedup | abs_err=2.38e-07, rel_err=3.05e-02
+  Workload d0e91dea...: PASSED | 9.440 µs (0.009440 ms) | 82.13x speedup | abs_err=5.96e-08, rel_err=1.05e-03
+  Workload ec9d2340...: PASSED | 9.837 µs (0.009837 ms) | 273.37x speedup | abs_err=1.49e-07, rel_err=5.89e-03
+  Workload 9f238670...: PASSED | 9.673 µs (0.009673 ms) | 277.24x speedup | abs_err=1.49e-08, rel_err=2.93e-03
+  Workload 6d929bff...: PASSED | 9.568 µs (0.009568 ms) | 280.78x speedup | abs_err=2.38e-07, rel_err=1.04e-02
+  Workload 494844dc...: PASSED | 9.897 µs (0.009897 ms) | 271.94x speedup | abs_err=2.98e-08, rel_err=4.09e-03
+  Workload 26f760ab...: PASSED | 10.129 µs (0.010129 ms) | 264.41x speedup | abs_err=8.94e-08, rel_err=5.22e-03
+  Workload deecf42e...: PASSED | 10.607 µs (0.010607 ms) | 252.14x speedup | abs_err=5.96e-08, rel_err=1.23e-02
+  Workload 9a92acbc...: PASSED | 9.681 µs (0.009681 ms) | 280.08x speedup | abs_err=5.96e-08, rel_err=3.87e-03
+  Workload fa90b213...: PASSED | 9.754 µs (0.009754 ms) | 273.95x speedup | abs_err=1.43e-06, rel_err=1.08e-01
+  Workload 2640f1e3...: PASSED | 10.148 µs (0.010148 ms) | 519.49x speedup | abs_err=1.19e-07, rel_err=4.07e-03
+  Workload 7464a1d6...: PASSED | 9.792 µs (0.009792 ms) | 541.36x speedup | abs_err=8.94e-08, rel_err=5.86e-03
+  Workload 25d1f606...: PASSED | 9.833 µs (0.009833 ms) | 522.81x speedup | abs_err=2.98e-08, rel_err=3.86e-03
+  Workload fe2e6584...: PASSED | 9.359 µs (0.009359 ms) | 576.36x speedup | abs_err=1.94e-07, rel_err=6.50e-03
+  Workload ca62112d...: PASSED | 9.756 µs (0.009756 ms) | 538.91x speedup | abs_err=5.96e-08, rel_err=5.71e-03
+  Workload 61dfd334...: PASSED | 9.604 µs (0.009604 ms) | 547.08x speedup | abs_err=3.81e-06, rel_err=7.63e-03
+  Workload abec5d32...: PASSED | 10.020 µs (0.010020 ms) | 527.74x speedup | abs_err=1.19e-07, rel_err=2.47e-02
+  Workload 76eec66d...: PASSED | 10.383 µs (0.010383 ms) | 984.63x speedup | abs_err=2.38e-07, rel_err=7.05e-02
+  Workload f0507025...: PASSED | 10.515 µs (0.010515 ms) | 976.73x speedup | abs_err=1.04e-06, rel_err=4.96e-02
+  Workload d1508f6d...: PASSED | 10.274 µs (0.010274 ms) | 1013.10x speedup | abs_err=1.19e-07, rel_err=6.61e-03
+  Workload 63d4cb66...: PASSED | 10.146 µs (0.010146 ms) | 990.72x speedup | abs_err=1.79e-07, rel_err=1.79e-02
+  Workload ef6bb01d...: PASSED | 9.862 µs (0.009862 ms) | 1039.90x speedup | abs_err=1.19e-07, rel_err=7.04e-03
+  Workload d0acf04a...: PASSED | 9.995 µs (0.009995 ms) | 1039.49x speedup | abs_err=7.63e-06, rel_err=1.45e-02
+  Workload ac83f1e4...: PASSED | 10.492 µs (0.010492 ms) | 987.42x speedup | abs_err=2.38e-07, rel_err=5.99e-03
+  Workload a8c8beff...: PASSED | 13.427 µs (0.013427 ms) | 1528.41x speedup | abs_err=9.31e-08, rel_err=6.00e-03
+  Workload 40940a4c...: PASSED | 12.077 µs (0.012077 ms) | 1727.55x speedup | abs_err=4.77e-07, rel_err=1.43e-01
+  Workload 0915952b...: PASSED | 12.491 µs (0.012491 ms) | 1669.14x speedup | abs_err=3.81e-06, rel_err=3.68e-02
+  Workload d38dde79...: PASSED | 11.925 µs (0.011925 ms) | 1724.61x speedup | abs_err=1.43e-06, rel_err=1.01e-01
+  Workload 388f79b1...: PASSED | 12.047 µs (0.012047 ms) | 1711.01x speedup | abs_err=2.38e-07, rel_err=7.75e-03
+  Workload 80288532...: PASSED | 11.942 µs (0.011942 ms) | 1676.84x speedup | abs_err=2.09e-07, rel_err=1.94e-02
+  Workload 773a4157...: PASSED | 11.838 µs (0.011838 ms) | 1713.00x speedup | abs_err=4.77e-07, rel_err=6.74e-03
+  Workload 53385c7f...: PASSED | 15.940 µs (0.015940 ms) | 1883.63x speedup | abs_err=3.81e-06, rel_err=2.29e-02
+  Workload 45e7697a...: PASSED | 16.006 µs (0.016006 ms) | 1891.68x speedup | abs_err=4.77e-07, rel_err=5.15e-03
+  Workload 34403e5b...: PASSED | 15.917 µs (0.015917 ms) | 1956.32x speedup | abs_err=9.54e-07, rel_err=2.26e-02
+  Workload b91cc4aa...: PASSED | 16.220 µs (0.016220 ms) | 1892.50x speedup | abs_err=4.17e-07, rel_err=3.24e-01
+  Workload 4c38f0e4...: PASSED | 16.045 µs (0.016045 ms) | 1894.56x speedup | abs_err=3.05e-05, rel_err=7.60e-02
+  Workload be91d78c...: PASSED | 15.966 µs (0.015966 ms) | 1859.90x speedup | abs_err=3.81e-06, rel_err=1.29e-01
+  Workload 3803367a...: PASSED | 15.618 µs (0.015618 ms) | 1968.58x speedup | abs_err=7.63e-06, rel_err=1.41e-02
+  Workload eaf0a285...: PASSED | 24.192 µs (0.024192 ms) | 1707.61x speedup | abs_err=1.91e-06, rel_err=2.67e-02
+  Workload f4fd2171...: PASSED | 24.250 µs (0.024250 ms) | 1704.29x speedup | abs_err=2.98e-08, rel_err=8.65e-03
+  Workload b1931bc6...: PASSED | 24.307 µs (0.024307 ms) | 1627.60x speedup | abs_err=9.54e-07, rel_err=2.76e-02
+  Workload 8d0c5789...: PASSED | 24.873 µs (0.024873 ms) | 1648.47x speedup | abs_err=9.54e-07, rel_err=7.01e-03
+  Workload 9eef9bc7...: PASSED | 24.181 µs (0.024181 ms) | 1690.61x speedup | abs_err=3.81e-06, rel_err=4.10e-02
+  Workload 58571e49...: PASSED | 23.921 µs (0.023921 ms) | 1700.21x speedup | abs_err=9.54e-07, rel_err=9.54e-02
+  Workload ef2cf980...: PASSED | 24.708 µs (0.024708 ms) | 1595.75x speedup | abs_err=3.81e-06, rel_err=3.35e-02
+  Workload 42963acb...: PASSED | 24.196 µs (0.024196 ms) | 1708.51x speedup | abs_err=3.05e-05, rel_err=3.93e-01
+[2026-04-24T12:05:31] Local entrypoint finished in 258.88s
+[2026-04-24T03:05:31] Remote benchmark finished in 241.33s
+Stopping app - local entrypoint completed.
+✓ App completed. View run at 
+https://modal.com/apps/kjms2026/main/ap-YesDVRSBEJOccHFrHZC5On

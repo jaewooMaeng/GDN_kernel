@@ -442,3 +442,18 @@ Key NCU fields to compare:
   - A3/A4 read-only state load path 검증 (`__ldg`, `ld.global.nc.v4.f32`) + SASS 확인: shared fan-out 대신 실제 load opcode를 바꾸는 방향.
   - G5 기준선 재고정: accepted kernel에 `-Xptxas -v -warn-spills`를 안전하게 주입해 register/spill/SASS mix를 확보한 뒤 다음 변형의 실패 원인을 더 명확히 볼 것.
   - C3/C4 미시적 FFMA 유도 (`__fmaf_rn`, `float4` dot helper): CTA 구조는 유지하고 hot loop instruction mix만 줄이는 방향.
+
+## iter #4 (2026-04-24 session)
+
+- 적용한 최적화: C3/C4 계열. `q/k`를 `float4`로 유지하고 `__fmaf_rn` helper로 dot/state update를 정리했으며, `g/beta/beta_g/qk_dot`를 기존 `s_v` barrier에 합쳐 block당 1회만 계산/배포하도록 바꿨다. 추가 barrier나 CTA 구조 변경은 넣지 않았다.
+- 측정된 avg latency: 5회 `[0.012688, 0.013137, 0.013102, 0.012761, 0.018742] ms`, median `0.013102 ms`, correctness `PASSED=54/54`. accepted baseline `0.012920 ms` median 대비 후퇴라 전체 롤백했다.
+- NCU Duration: 롤백 후 current accepted kernel 기준 `32.58 us`.
+- 남아있는 주요 bottleneck: accepted kernel NCU는 `Grid Size=1024`, `Waves/SM=0.77`, `Issue Slots Busy=17.60%`, `Memory Throughput=29.07%`, `DRAM Throughput=24.91%`, `L1/TEX Throughput=47.67%`, `L2 Throughput=20.12%`, `Achieved Occupancy=30.61%`, `Registers/thread=56`, local spilling `0`, `L1 hit=5.37%`, `L2 hit=1.53%`다. 여전히 single-pipeline saturation이 아니라 small-grid / low-issue / reg-limited occupancy / poor-cache-hit 성격이 핵심이다.
+- 이번에 시도했거나 검토했지만 안 좋다고 판단한 방향:
+  - 후보: all-path `float4` q/k + `__fmaf_rn` + existing-barrier block scalar dedup.
+  - 안 좋은 이유: source-level FFMA/live-range cleanup만으로는 benchmark median을 움직이지 못했다. 5회 median이 `0.013102 ms`로 baseline `0.012920 ms`보다 느렸고, B=64 `eaf0a285`도 대부분 `0.024~0.025 ms` 수준에 머물렀으며 5회차는 `0.028653 ms`까지 튀었다. current bottleneck이 instruction-form보다 launch shape / occupancy / bytes-in-flight 쪽에 더 가깝다는 점이 다시 확인됐다.
+  - 재시도 가능 조건: Modal compile path에서 `-Xptxas -v` 또는 SASS로 register가 실제 `56 -> 52 이하`로 줄어드는 증거가 나오거나, same change를 small-batch 또는 large-batch 한쪽 path에만 격리해 노이즈 없이 검증할 수 있을 때.
+- 다음 iteration 에서 시도할만한 후보 2~3 개:
+  - G5 기준선 확보: Modal compile 로그에서 `-Xptxas -v -warn-spills`를 실제로 확보해 register/spill/SASS mix를 고정하고, 다음 변화가 정말 `56 regs`를 깎는지 먼저 본다.
+  - A3/A4 read-only state load path 검증 (`__ldg`, `ld.global.nc.v4.f32`): 단, load opcode가 실제로 바뀌는지 확인 가능한 경로에서만 시도한다.
+  - B2/H2 계열의 block-wide async pipeline: per-thread async copy(R5)와 달리 block/warp 단위 `cuda::pipeline` 또는 `cp.async`로 bytes-in-flight를 키우는 방향만 남겨둔다.

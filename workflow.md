@@ -239,7 +239,7 @@ setmaxnreg.inc.sync.aligned.u32 N / setmaxnreg.dec.sync.aligned.u32 N
 
 - [x] **C1. Gate 계산 lane 0 집중 + shuffle broadcast** [적용됨 Iter 20]: SFU throughput 경쟁 해소, Phase 2 break-through.
 - [ ] **C2. `__reduce_add_sync()` intrinsic으로 warp reduction 대체**: 현재 5-stage `__shfl_down_sync` butterfly. SM100 native `redux.sync.add.f32` 1-instruction. `-arch=sm_100a` 필수. PTX `redux.sync` 생성 확인. **[시도됨 iter #3, build blocked; 재시도됨 2026-04-24 session iter #1, inline PTX도 blocked]** 현재 Modal `tvm_ffi`/nvcc 경로에서는 `__reduce_add_sync(float)` overload가 보이지 않아 전 workload compile failure가 났고, inline PTX `redux.sync.add.f32`도 CUDA 13.0 `ptxas`에서 `Incorrect type '.f32' for operation '.add'`로 거부됐다. Modal toolchain에서 float warp-reduce add 지원이 실제로 확인되기 전에는 재시도하지 않는다.
-- [ ] **C3. 명시적 FMA (`__fmaf_rn()`)**: 현재 dot product / state update가 nvcc FMA 자동 생성 의존. PTX 생성 물(FFMA vs FADD+FMUL) 검증 후 미생성 구간 명시적 호출.
+- [ ] **C3. 명시적 FMA (`__fmaf_rn()`)**: 현재 dot product / state update가 nvcc FMA 자동 생성 의존. PTX 생성 물(FFMA vs FADD+FMUL) 검증 후 미생성 구간 명시적 호출. **[시도됨 2026-04-24 session iter #4, 후퇴]** `C4`와 묶어 `q/k`를 `float4`로 유지하고 `__fmaf_rn` helper, `g/beta/beta_g/qk_dot` block-scalar dedup를 기존 `s_v` barrier에 합쳐 live range를 줄이는 all-path 미세 최적화를 넣었지만 5회 avg가 `[0.012688, 0.013137, 0.013102, 0.012761, 0.018742] ms`, median `0.013102 ms`로 accepted baseline `0.012920 ms`보다 악화됐다. standalone FFMA/live-range cleanup만으로는 current low-issue / reg-limited occupancy 병목을 움직이지 못했고 long-tail variance도 커졌다. 같은 all-path 안은 재시도하지 않고, **SASS/ptxas 기준으로 register가 실제 `56 -> 52 이하`로 감소한다는 근거가 있거나 특정 batch path에만 격리해 검증할 수 있을 때만** 다시 본다.
 - [ ] **C4. k_vals/q_vals를 `float4` 자료형으로 유지**: 현재 개별 float 배열. `float4 k4, q4;`로 보관 → nvcc FFMA4 자동 생성 유도, state `float4`와 layout 일치.
 - [ ] **C5. Output 계산 fusion 추가**: `scale_g * qs_x + scale_qk * res_x` 이미 pre-computed 상수 활용. 추가 여지 낮음.
 - [x] **C6. Fast math intrinsic (gate)** [시도됨 Iter 2, 후퇴]. 재시도 금지.
@@ -413,6 +413,7 @@ B200 SM ≈ 148:
 | R7 | inline PTX `redux.sync.add.f32` blocked, fallback state access-property persisting | 0.018830 avg | 롤백 |
 | R8 | `B>=32` compile-time 2-CTA cluster q/k 공유 | 0.018499 avg | 롤백 |
 | R9 | `warp0` q/k shared stage + CTA scalar dedup (all paths) | 0.012932 avg / rollback baseline 0.012671 avg | 롤백 |
+| R10 | `float4` q/k + `__fmaf_rn` + existing-barrier block scalar dedup | 0.013102 median | 롤백 |
 
 **핵심 인사이트 (Iter 20)**: 32 lanes 동시 exp/log1p → SFU throughput 심각 경쟁. Lane 0 전담 + 3 shuffle로 SFU 경쟁 완전 제거 = Phase 2 break-through.
 
@@ -433,6 +434,8 @@ B200 SM ≈ 148:
 **R8 인사이트**: `batch_size >= 32` 경로만 compile-time 2-CTA cluster로 바꿔 rank 0 CTA의 distributed shared memory `q/k` staging을 pair-CTA가 재사용하게 해도 benchmark는 크게 악화됐다. full benchmark avg가 `0.018499 ms`로 baseline `0.012920 ms`보다 크게 느려졌고, 핵심 B=64 `eaf0a285`도 `0.029220 ms`까지 상승했다. minimal cluster q/k-share-only 안은 cluster barrier와 remote shared read overhead를 상쇄하지 못했으므로, 다음 cluster 재시도는 qk reduction 1회화 또는 async producer/consumer와 결합되는 더 강한 구조 변경일 때만 검토한다.
 
 **R9 인사이트**: E1 계열을 더 좁혀 `warp0`만 q/k와 block-invariant scalar를 준비하고 기존 `s_v` barrier로 CTA 전체에 배포하는 변형까지 시도했지만, same-day baseline full benchmark를 넘지 못했다. full avg는 `0.012932 ms`였고 rollback 후 accepted baseline은 `0.012671 ms`였다. extra barrier를 제거해도 shared q/k fan-out cost가 남았고, standalone CTA-local q/k dedup만으로는 current kernel의 low-issue / small-grid 병목을 충분히 움직이지 못했다.
+
+**R10 인사이트**: `q/k float4 + __fmaf_rn` helper와 기존 `__syncthreads()`를 재활용한 block-scalar dedup(`g/beta/beta_g/qk_dot`)을 묶어도 benchmark는 개선되지 않았다. 5회 avg가 `[0.012688, 0.013137, 0.013102, 0.012761, 0.018742] ms`였고 median은 `0.013102 ms`로 accepted baseline `0.012920 ms`보다 악화됐다. B=64 `eaf0a285`도 대부분 `0.024~0.025 ms`에 머물렀고 5회차는 `0.028653 ms`까지 튀었다. source-level FFMA/live-range cleanup만으로는 current low-issue / reg-limited occupancy 병목을 못 움직였으므로, 다음에는 실제 register 감소 근거가 있는 SASS/ptxas 기준선 확보나 특정 batch-path 격리 없이는 같은 계열을 재시도하지 않는다.
 
 ### Phase 3+ 기록 템플릿
 
