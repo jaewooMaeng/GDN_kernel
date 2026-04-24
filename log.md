@@ -409,3 +409,18 @@ Key NCU fields to compare:
   - B1 2-CTA cluster q/k 공유: 현재 repeated failure의 공통 원인인 q/k load 및 qk reduction 중복을 직접 줄이는 방향.
   - A3/A4 read-only load path 검증 (`__ldg`, `ld.global.nc.v4.f32`) + SASS 확인: 단, standalone cache-hint 재시도 대신 실제 load opcode 변화가 보일 때만.
   - G5 ptxas/SASS 기준선 재고정: `Registers/thread=56`, spill 0, `LDG/FFMA/SHFL` 비율을 먼저 고정해 다음 구조 변경의 성공/실패 이유를 더 분명히 볼 것.
+
+## iter #2 (2026-04-24 session)
+
+- 적용한 최적화: B1 최소형. `batch_size >= 32` (`split_factor=2`, `ROWS_PER_WARP=16`) 경로에 compile-time `__cluster_dims__(2,1,1)` cluster kernel을 추가하고, 같은 `qkh/split_id`를 처리하는 두 CTA가 rank 0 CTA의 distributed shared memory `q/k` staging을 재사용하도록 변경했다. 첫 full benchmark에서 regression이 커 전체 롤백함.
+- 측정된 avg latency: 1회 `0.018499 ms`, correctness `PASSED=54/54`. Phase 3+는 5회 median 판정이 원칙이지만 accepted baseline(`0.012920 ms` median)보다 크게 느려 workflow의 즉시 롤백 규칙에 따라 추가 4회 반복 없이 중단했다. 핵심 B=64 workload `eaf0a285`는 `0.029220 ms`.
+- NCU Duration: 롤백 후 현재 accepted kernel 기준 `32.99 us`.
+- 남아있는 주요 bottleneck: rollback 후 profiled kernel은 `Grid Size=1024`, `Waves/SM=0.77`, `Issue Slots Busy=17.32%`, `Memory Throughput=28.58%`, `DRAM Throughput=24.33%`, `L1/TEX Throughput=47.10%`, `L2 Throughput=19.84%`, `Achieved Occupancy=28.29%`, `Registers/thread=56`, local spilling `0`, `L1 hit=5.37%`, `L2 hit=1.48%`다. 여전히 small-grid / low-issue / register-limited occupancy / poor-cache-hit 성격이 강하다.
+- 이번에 시도했거나 검토했지만 안 좋다고 판단한 방향:
+  - 후보: B1 최소형 compile-time 2-CTA cluster q/k 공유 (`__cluster_dims__(2,1,1)`, rank 0 DSMEM staging, pair-CTA reuse).
+  - 안 좋은 이유: q/k global 중복은 줄었지만 cluster barrier와 remote shared read cost가 크게 들어서 full benchmark avg가 `0.018499 ms`로 baseline보다 크게 후퇴했고, 핵심 B=64 workload `eaf0a285`도 `0.029220 ms`까지 상승했다. standalone cluster q/k-share-only 안은 kernel Duration과 benchmark latency 둘 다 개선 근거를 만들지 못했다.
+  - 재시도 가능 조건: cluster를 다시 보더라도 q/k global load 절감만으로는 부족하다. qk reduction까지 cluster/block당 1회화하거나, `cuda::pipeline`/`cp.async` producer-consumer와 결합해 cluster sync 비용을 숨길 수 있을 때만 재검토한다.
+- 다음 iteration 에서 시도할만한 후보 2~3 개:
+  - A3/A4 read-only state load path 검증 (`__ldg`, `ld.global.nc.v4.f32`) + SASS 확인: standalone cache-hint 대신 실제 load opcode 변화가 보이는 방향.
+  - C3/C4 FFMA 유도 (`__fmaf_rn`, `float4 q/k` 유지)로 hot loop issue slots를 소폭 끌어올리는 방향.
+  - G5 + SASS/ptxas 기준선 재고정: accepted kernel의 `Registers/thread=56`, spill 0, `LDG/FFMA/SHFL` 비율을 먼저 고정하고 다음 구조 변경 리스크를 줄일 것.

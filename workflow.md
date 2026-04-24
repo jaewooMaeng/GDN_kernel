@@ -212,7 +212,7 @@ setmaxnreg.inc.sync.aligned.u32 N / setmaxnreg.dec.sync.aligned.u32 N
 
 **참조**: CUTLASS `sm90_mma_tma_gmma_ss_warpspecialized.hpp` (cluster_shape=(2,1,1) 구간), CUTLASS `examples/70_blackwell_gemm`, FlashAttention v3 mainloop, NVIDIA CUDA Programming Guide "Thread Block Clusters" + "Distributed Shared Memory".
 
-- [ ] **B1. 2-CTA Cluster로 q/k 공유** ★ **가장 유력** ★: V_PER_Q=2 → 같은 qk_head를 쓰는 2개 v_head block을 cluster로 묶는다.
+- [ ] **B1. 2-CTA Cluster로 q/k 공유** ★ **가장 유력** ★: V_PER_Q=2 → 같은 qk_head를 쓰는 2개 v_head block을 cluster로 묶는다. **[시도됨 2026-04-24 session iter #2, 후퇴]** `batch_size >= 32` 경로만 compile-time `__cluster_dims__(2,1,1)` cluster kernel로 분기하고 rank 0 CTA가 q/k를 distributed shared memory에 적재해 pair-CTA가 재사용하도록 했지만 full benchmark avg가 `0.018499 ms`, B=64 `eaf0a285`가 `0.029220 ms`로 크게 악화됐다. minimal q/k-share-only 안은 재시도하지 않고, 향후에는 qk reduction 1회화 또는 `cuda::pipeline`/`cp.async`와 결합해 cluster sync cost를 숨길 수 있을 때만 다시 본다.
   - `__cluster_dims__(2, 1, 1)` 또는 host에서 `cudaLaunchKernelEx` + `cudaLaunchAttribute::clusterDim = {2,1,1}`.
   - Grid 재구성: `(batch × NUM_Q_HEADS × split_factor, 2, 1)`.
   - q, k를 distributed SMEM에 cluster 내 **1회만** 로드 후 `cluster.mapa.shared::cluster`로 상대 block 접근 → bf16 read **절반**.
@@ -411,6 +411,7 @@ B200 SM ≈ 148:
 | R5 | RPW=16 warp-private `__pipeline_memcpy_async` + `sm_100a` JIT flags | 0.013124 avg | 롤백 |
 | R6 | `B>=32` 전용 256-thread / 8-warp large-batch path | 0.012979 avg | 롤백 |
 | R7 | inline PTX `redux.sync.add.f32` blocked, fallback state access-property persisting | 0.018830 avg | 롤백 |
+| R8 | `B>=32` compile-time 2-CTA cluster q/k 공유 | 0.018499 avg | 롤백 |
 
 **핵심 인사이트 (Iter 20)**: 32 lanes 동시 exp/log1p → SFU throughput 심각 경쟁. Lane 0 전담 + 3 shuffle로 SFU 경쟁 완전 제거 = Phase 2 break-through.
 
@@ -427,6 +428,8 @@ B200 SM ≈ 148:
 **R6 인사이트**: `batch_size >= 32` large-batch path만 256-thread / 8-warp로 키워 per-CTA parallelism을 늘려도 benchmark는 개선되지 않았다. 전체 avg가 `0.012979 ms`로 baseline `0.012920 ms`보다 소폭 나빠졌고, 핵심 타깃 B=64 `eaf0a285`는 `0.023968 ms`로 baseline(`0.021~0.022 ms`)보다 느려졌다. standalone 256-thread 확대만으로는 q/k load와 qk reduction의 warp 중복, `ROWS_PER_WARP=8`로 줄어든 per-warp ILP를 상쇄하지 못했다. 다음 large-batch 재시도는 q/k shared/cluster 공유처럼 warp 중복 제거와 결합될 때만 검토한다.
 
 **R7 인사이트**: C2의 inline PTX 경로까지 시도했지만 현재 Modal CUDA 13.0 `ptxas`는 `redux.sync.add.f32`를 실제로 수용하지 않았다. 또한 A2 성격의 standalone state access-property persisting 힌트는 full benchmark avg를 `0.018830 ms`까지 악화시켰다. 현재 단계에서는 문서상 가능성만 있는 float warp-reduce/soft cache-hint보다, load opcode를 실제로 바꾸는 A3/A4 검증이나 q/k 중복 제거(B1)처럼 보다 구조적인 변화가 우선이다.
+
+**R8 인사이트**: `batch_size >= 32` 경로만 compile-time 2-CTA cluster로 바꿔 rank 0 CTA의 distributed shared memory `q/k` staging을 pair-CTA가 재사용하게 해도 benchmark는 크게 악화됐다. full benchmark avg가 `0.018499 ms`로 baseline `0.012920 ms`보다 크게 느려졌고, 핵심 B=64 `eaf0a285`도 `0.029220 ms`까지 상승했다. minimal cluster q/k-share-only 안은 cluster barrier와 remote shared read overhead를 상쇄하지 못했으므로, 다음 cluster 재시도는 qk reduction 1회화 또는 async producer/consumer와 결합되는 더 강한 구조 변경일 때만 검토한다.
 
 ### Phase 3+ 기록 템플릿
 
@@ -473,6 +476,6 @@ B200 SM ≈ 148:
 - **개선 < 0.001 ms**: 소규모 최적화 조합 고려. 단독으로는 판단 어려움.
 - **누적**: 성공한 최적화 위에 다음을 쌓는다.
 - **Phase 3 돌파 추천 순서**: G5 (spill 분석) → A2 (annotated_ptr) → A3/A4 (ldg/nc) → G4 (sm_100a 확인) → C2 (reduce_add_sync) → I1 (L2 warmup). 구현 난이도 낮은 것부터.
-- **Phase 4 돌파 추천 순서**: B1 (2-CTA cluster) → B2/H2 (async pipeline) → B5 (warp specialization) → D5 (단, graph를 wrapper 바깥 반복 루프에서 재사용할 수 있을 때만). 현재 harness 경로에선 D5가 bad direction이었다.
+- **Phase 4 돌파 추천 순서**: B1 변형 (단, R8의 minimal q/k-share-only 안 제외) → B2/H2 (async pipeline) → B5 (warp specialization) → D5 (단, graph를 wrapper 바깥 반복 루프에서 재사용할 수 있을 때만). 현재 harness 경로에선 D5가 bad direction이었다.
 - **10회 이상 답보**: `ncu --set full` + `cuobjdump --dump-sass` 로 병목 재확인 (`smsp__inst_executed_pipe_*`, `smsp__warp_issue_stalled_*`, SASS 내 FFMA/LDG/SHFL 비율). 사용자에게 결과 공유.
 - `modal run` 컴파일 에러 즉시 해결. `-Xptxas -v` 출력은 매 변경 후 확인 (register/spill 추적).
