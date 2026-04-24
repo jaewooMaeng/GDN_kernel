@@ -199,7 +199,7 @@ setmaxnreg.inc.sync.aligned.u32 N / setmaxnreg.dec.sync.aligned.u32 N
   asm volatile("ld.global.nc.v4.f32 {%0,%1,%2,%3}, [%4];" : "=f"(x),"=f"(y),"=f"(z),"=f"(w) : "l"(ptr));
   ```
 - [ ] **A5. `missProp=Streaming` 실험**: 현재 `missProp=Normal`. state miss 시 L2 오염 방지. Prefetch 리듬이 일정하면 차이 미미하나 B=64+ 대배치에서 state가 L2의 25% 차지 → miss 비중 의미 있을 수 있음.
-- [ ] **A6. Shared memory carveout = 0 (L1 극대화)**: `cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 0)`. 현재 s_v 512B만 사용 → L1 확대로 state L1 hit 증가 유도.
+- [ ] **A6. Shared memory carveout = 0 (L1 극대화)**: `cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 0)`. 현재 s_v 512B만 사용 → L1 확대로 state L1 hit 증가 유도. **[시도됨 2026-04-24 codex iter #3, 롤백]** host launch 경로에 variant별 1회 `PreferredSharedMemoryCarveout=0`만 추가한 standalone 실험을 했지만, decision-gate B=64 workload `eaf0a285`가 `0.028602 ms`로 recent accepted band(`~0.021~0.024 ms`)보다 명확히 느려 full benchmark/NCU 전에 즉시 롤백했다. carveout 단독안은 재시도하지 않고, 이후에는 load opcode 변경(A3/A4)이나 q/k 중복 제거(B1)처럼 더 직접적인 구조 변화가 있을 때만 다시 본다.
 - [ ] **A7. 반대 실험: carveout = MAX**: 대용량 SMEM으로 state 일부 bring-down 준비 (H 카테고리 도입 시 필수).
 - [ ] **A8. s_v[] broadcast 효율 확인**: 모든 thread가 동일 `s_v[vi_a]` 접근 → hardware broadcast 기대. `cuobjdump` 로 `LDS.U.32.BROADCAST` 또는 `MOVM`의 broadcast 모드 확인. 불완전 시 `__shfl_sync(0xffffffff, reg_val, src_lane)`로 레지스터 broadcast 대체.
 - [ ] **A9. bf16 vectorized load 폭 증가 시도**: 현재 k, q 각각 `uint2` (64-bit) × 1 → 128-bit 못 채움. 가능하면 레이아웃 조정으로 128-bit 통합 고려 (비현실적일 수 있음).
@@ -416,6 +416,7 @@ B200 SM ≈ 148:
 | R9 | `warp0` q/k shared stage + CTA scalar dedup (all paths) | 0.012932 avg / rollback baseline 0.012671 avg | 롤백 |
 | R10 | `float4` q/k + `__fmaf_rn` + existing-barrier block scalar dedup | 0.013102 median | 롤백 |
 | R11 | G5-lite wrapper ptxas flags (`-Xptxas -v -warn-spills`) | 0.015814 median | 롤백 |
+| R13 | A6 standalone `PreferredSharedMemoryCarveout=0` | `eaf0a285` decision gate 0.028602 avg | 롤백 |
 
 **핵심 인사이트 (Iter 20)**: 32 lanes 동시 exp/log1p → SFU throughput 심각 경쟁. Lane 0 전담 + 3 shuffle로 SFU 경쟁 완전 제거 = Phase 2 break-through.
 
@@ -442,6 +443,8 @@ B200 SM ≈ 148:
 **R11 인사이트**: append-only `-Xptxas -v -warn-spills` 자체는 “compile/codegen 기준선 재고정” 의도였지만, benchmark runtime path에 wrapper flag를 직접 얹는 방식은 5회 순차 median이 `0.015814 ms`로 크게 후퇴해 채택할 수 없었다. 동시에 rollback 후 NCU는 현재 accepted large-batch 경로가 `gdn_decode_kernel<8>`, `Grid Size=2048`, `Duration=31.97 us`, `Issue Slots Busy=21.98%`, `Achieved Occupancy=40.11%`, `Registers/thread=56`, spill `0`임을 다시 보여 줬다. 다음 기준선 고정 작업은 benchmark path 밖의 standalone build/objdump로 옮기고, 실제 kernel-side 후보는 B2/H2 block-wide async pipeline이나 A5 `missProp=Streaming`처럼 Duration을 직접 건드리는 안으로 좁히는 편이 낫다.
 
 **R12 인사이트**: current accepted `gdn_decode_kernel<8>` large-batch path에 2-stage `cp.async` shared double-buffer를 붙인 standalone async staging도 B=64 decision gate에서 `0.028864 ms`로 후퇴했다. `ROWS_PER_WARP=8` path는 현재 4-row stage가 두 번뿐이라 register pressure 완화보다 commit/wait + shared round-trip cost가 더 크게 작용했고, 같은 current-kernel<8> async fetch 치환은 더 깊은 pipeline이나 q/k 중복 제거와 결합되지 않는 한 우선순위를 낮춘다.
+
+**R13 인사이트**: A6 standalone `PreferredSharedMemoryCarveout=0`도 B=64 decision gate에서 `0.028602 ms`로 recent accepted band(`~0.021~0.024 ms`)보다 명확히 느려졌다. 현재 커널은 shared usage가 작지만, carveout만으로는 low-issue / low-occupancy / poor-cache-hit 병목을 움직이지 못했고 host-side attribute 설정만으로 benchmark latency가 악화될 수 있음을 확인했다. 이후 메모리 계열은 carveout/L2 힌트 단독안보다 실제 load path(A3/A4) 변경이나 q/k 중복 제거(B1)처럼 더 직접적인 구조 변화에 집중한다.
 
 ### Phase 3+ 기록 템플릿
 

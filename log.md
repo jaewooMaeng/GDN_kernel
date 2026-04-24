@@ -486,3 +486,18 @@ Key NCU fields to compare:
   - current `gdn_decode_kernel<8>` path는 4-row stage가 두 번뿐이라 async depth가 너무 얕다.
   - `cp.async` commit/wait와 shared round-trip 비용이 register pressure 완화 이득을 상쇄했다.
   - 즉, standalone state-fetch 치환만으로는 current low-issue / reg-limited occupancy 병목을 못 움직였다.
+
+## iter #3 (2026-04-24 codex)
+
+- 적용한 최적화: 승인안 A6 standalone. `solution/cuda/kernel.cu` host launch 경로에 variant별 1회 `cudaFuncAttributePreferredSharedMemoryCarveout = 0` 설정만 추가했고, kernel body/dispatch/L2 persistence는 건드리지 않았다.
+- 측정된 latency: 패킹은 성공했다. full benchmark 5회 median으로 가기 전에 rollback gate 확인용 `eaf0a285` decision-gate를 별도로 돌렸고, 결과는 `PASSED`, `avg latency = 0.028602 ms`였다. recent accepted B=64 band(`~0.021~0.024 ms`)보다 명확히 느려 approved gate 기준으로 즉시 롤백했다.
+- full benchmark / NCU: full `modal run scripts/run_modal.py` 1회차는 이미 시작돼 있었지만, decision-gate regression 확인 직후 중단했다. rollback iteration 이므로 5회 full benchmark와 NCU profiling은 진행하지 않았다.
+- 판정: `PreferredSharedMemoryCarveout=0` standalone 안은 채택하지 않는다. `solution/cuda/kernel.cu`는 원상 복구했다.
+- 이번에 시도했거나 검토했지만 안 좋다고 판단한 방향:
+  - 후보: A6 standalone `PreferredSharedMemoryCarveout=0`.
+  - 안 좋은 이유: 현재 커널은 shared usage가 매우 작지만, carveout 조정만으로는 low-issue / low-occupancy / poor-cache-hit 병목을 움직이지 못했다. 핵심 B=64 gate가 `0.028602 ms`까지 악화된 만큼, host-side cache partition 단독안의 leverage는 충분히 낮다고 본다.
+  - 재시도 가능 조건: carveout 단독 재시도는 하지 않는다. 이후에는 load opcode 자체를 바꾸는 A3/A4, 혹은 q/k 중복을 줄이는 B1 같은 구조적 변화가 같이 있을 때만 다시 검토한다.
+- 다음 iteration 에서 시도할만한 후보 2~3 개:
+  - A3/A4 read-only load path 검증 (`__ldg`, `ld.global.nc.v4.f32`) + SASS 확인.
+  - B1 변형: q/k global/reduction 중복을 더 직접적으로 줄이는 구조적 안만 제한적으로 재검토.
+  - G5를 benchmark path 밖 standalone build/objdump 경로로 분리해 `56 regs`, spill `0`, load opcode 사실관계를 먼저 고정.
