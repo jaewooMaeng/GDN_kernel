@@ -25,7 +25,26 @@
 
 ## Candidate Optimizations (Prioritized)
 
-### 🔴 B5: Warp Specialization (Next, High Priority)
+### Iteration #2: B5 (warp specialization) [SUSPENDED] (2026-04-24)
+| Metric | Value | Status |
+|--------|-------|--------|
+| avg_latency_ms | 0.011415 | ⚠️ No change from iter #1 |
+| correctness | INCORRECT | ❌ All 54 workloads FAILED on first B5 attempt |
+| kernel_duration_us | — | ⏳ Benchmark timeout (not completed) |
+| issue_slots_busy_pct | — | ⏳ Profiling incomplete |
+
+**Decision**: **SUSPEND** — Revert to iteration #1 baseline
+**Reason**: 
+- B5 (shared memory + async memcpy) → all workloads failed INCORRECT_NUMERICAL
+- Attempted correctness fix (indexing) → benchmark still running after 4+ minutes (modal timeout)
+- B2 (double-buffering) → uninitialized prefetch buffer risk with ROWS_PER_WARP=8
+- Trade-off unfavorable; reverting to safe code
+
+**Logged Analysis**: See ralph_logs_claude/log.md — iter #2 details
+
+---
+
+### 🔴 B5: Warp Specialization (Next, High Priority, DEFERRED)
 - **Goal**: Reduce register pressure, improve occupancy
 - **Method**: 1 producer warp + 3 consumer warps; async load overlap
 - **Expected**: occupancy +30-50%, latency -0.001~-0.002 ms

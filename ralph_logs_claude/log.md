@@ -79,3 +79,88 @@ Occupancy:
 - Benefit: Reduces register pressure on consumer warps, improves occupancy
 - Risk: Sync overhead, potential latency regression if mbarrier cost is high
 
+---
+
+## iter #2 (2026-04-24) — B5 Attempt: Warp Specialization (SUSPENDED)
+
+### Approach
+**Primary (B5)**: Warp Specialization with async memcpy + cuda::pipeline
+- Warp 0 (producer): Async load entire split's state to shared memory via `cuda::memcpy_async`
+- Warp 1-3 (consumers): Compute from shared memory
+- Synchronization: `cuda::pipeline_consumer_wait_prior()`
+- Goal: Increase per-warp ILP and reduce register pressure
+
+**Fallback (B2)**: Async Pipeline with double-buffering
+- Extend prefetch depth to 8 rows (dual buffers)
+- Rotate prefetches per loop iteration
+- Goal: Overlap load/compute by 2× iteration depth
+
+### Implementation Attempt: B5
+
+#### Phase 1: Initial B5 with async memcpy
+- Added `#include <cuda/pipeline>`
+- Declared `__shared__ float4 s_state_prefetch[PREFETCH_BUFFER_ELEMS]` (runtime-sized based on ROWS_PER_BLOCK)
+- Warp 0 producer: `for (int i = tid; i < total_f4s; i += blockDim.x) cuda::memcpy_async(...)`
+- All warps consumer: Read from shared memory instead of `__ldg()`
+
+**Result**: **INCORRECT_NUMERICAL on all 54 workloads**
+- Likely cause: Shared memory indexing mismatch
+  - Warp 0 loaded [split_id × ROWS_PER_BLOCK, split_id × ROWS_PER_BLOCK + ROWS_PER_BLOCK) rows
+  - Each warp accessed different subset (vi_start offset varies by warp_id)
+  - Incorrect offset calculation → wrong state values read
+
+#### Phase 2: Corrected Indexing
+- Added `split_start_row` calculation: `split_id * ROWS_PER_BLOCK`
+- Producer: `cuda::memcpy_async(&s_state_prefetch[i], &state_base_f4[split_start_idx + i], ...)`
+- Consumers: Used `block_local_vi = block_local_vi_start + vi_off` as shared memory index
+
+**Result**: Benchmark **still running** (modal timeout 240s+)
+- Correctness unknown (not yet reported)
+- Compilation successful (CUDA 13.0.2)
+- Profiling incomplete
+
+#### Phase 3: Fallback to B2 (double-buffering)
+- Attempted 8-row prefetch (dual buffers): `pf_a_next = prefetch iteration i+1`
+- Rotate logic: `pf_a = pf_a_next` per iteration
+- Prefetch lookahead: `if (vi_off + 8 < ROWS_PER_WARP) { pf_a_next = ... }`
+
+**Issue**: Uninitialized prefetch buffer with ROWS_PER_WARP = 8
+- vi_off = 0: prefetch check (0 + 8 < 8) → FALSE; pf_a_next not updated
+- vi_off = 4: rotate → pf_a = uninitialized pf_a_next
+- Result: Potential correctness issues
+
+**Decision**: Reverted to simpler single-buffer pattern (original iteration #1 code)
+
+### Final Status
+
+**Iteration #2 Result**: **SUSPENDED (reverted to iter #1 baseline)**
+- B5: Correctness fail + benchmark timeout (not conclusive)
+- B2: Uninitialized prefetch risk; reverted to safe pattern
+- Current kernel: Same as iteration #1 (avg_latency = 0.011415 ms)
+
+**Performance**: No improvement from iteration #1
+- avg_latency: 0.011415 ms (unchanged)
+- Reason: Async pipeline/warp specialization not successfully implemented
+
+**Lessons Learned**
+1. **FFI/CUDA Pipeline compatibility**: `cuda::pipeline` + shared memory staging more fragile than expected
+2. **Shared memory indexing complexity**: Multi-warp access patterns require careful offset calculations
+3. **Prefetch rotation logic**: Dual-buffering with conditional prefetch is error-prone; safer to use single-step lookahead
+4. **Modal timeout**: Benchmark takes 3–5 min per run; need faster feedback loop
+
+### Recommendations for Iteration #3
+
+1. **Lower-risk approach**: Use loop unrolling + aggressive prefetch without warp specialization
+   - Modify `#pragma unroll 4` directive
+   - Increase prefetch depth via compiler optimization
+   - Keep original synchronous read pattern
+
+2. **Alternative**: **Split factor increase (I1)** if host overhead acceptable
+   - Change split_factor: 2→4, 4→8 (double grid size)
+   - Increases bytes-in-flight and grid parallelism
+   - Low implementation risk (constant changes only)
+
+3. **Deep investigation needed**: Profile bandwidth bottleneck vs. compute bottleneck
+   - Current 17.33% issue slot busy suggests compute-starved, not memory-starved
+   - Revisit kernel math (Q·S, K·S reductions) for parallelization opportunities
+
