@@ -217,7 +217,7 @@ setmaxnreg.inc.sync.aligned.u32 N / setmaxnreg.dec.sync.aligned.u32 N
   - Grid 재구성: `(batch × NUM_Q_HEADS × split_factor, 2, 1)`.
   - q, k를 distributed SMEM에 cluster 내 **1회만** 로드 후 `cluster.mapa.shared::cluster`로 상대 block 접근 → bf16 read **절반**.
   - 효과 예상: q/k load 오버헤드가 전체의 ~10%라 가정 시 5% (0.0005 ms) 수준. 단, cluster sync 오버헤드 상쇄 필요.
-- [ ] **B2. `cuda::pipeline<thread_scope_block, 3>` + `cuda::memcpy_async` state row prefetch**: 현재 register-based 4-row pipeline (`pf_a,b,c,d`)을 SMEM 3-stage async pipeline으로 전환.
+- [ ] **B2. `cuda::pipeline<thread_scope_block, 3>` + `cuda::memcpy_async` state row prefetch**: 현재 register-based 4-row pipeline (`pf_a,b,c,d`)을 SMEM 3-stage async pipeline으로 전환. **[시도됨 2026-04-24 codex iter #2, 후퇴]** current accepted `gdn_decode_kernel<8>` large-batch path만 2-stage `cp.async` shared double-buffer로 바꾼 축소안을 넣고 B=64 `eaf0a285` decision gate를 돌렸지만 `0.028864 ms` (`PASSED`)로 recent accepted band(`~0.021~0.024 ms`)보다 명확히 느렸다. `ROWS_PER_WARP=8` path는 4-row chunk가 두 번뿐이라 stage depth가 얕아 bytes-in-flight 증가보다 commit/wait + shared reload cost가 더 컸던 것으로 보이며, **같은 standalone async fetch 치환은 더 깊은 pipeline이나 q/k 중복 제거 결합 근거가 생길 때까지 보류**한다.
   ```
   stage 0: compute row i
   stage 1: arriving  row i+1 (2 iters ago 발행)
@@ -440,6 +440,8 @@ B200 SM ≈ 148:
 **R10 인사이트**: `q/k float4 + __fmaf_rn` helper와 기존 `__syncthreads()`를 재활용한 block-scalar dedup(`g/beta/beta_g/qk_dot`)을 묶어도 benchmark는 개선되지 않았다. 5회 avg가 `[0.012688, 0.013137, 0.013102, 0.012761, 0.018742] ms`였고 median은 `0.013102 ms`로 accepted baseline `0.012920 ms`보다 악화됐다. B=64 `eaf0a285`도 대부분 `0.024~0.025 ms`에 머물렀고 5회차는 `0.028653 ms`까지 튀었다. source-level FFMA/live-range cleanup만으로는 current low-issue / reg-limited occupancy 병목을 못 움직였으므로, 다음에는 실제 register 감소 근거가 있는 SASS/ptxas 기준선 확보나 특정 batch-path 격리 없이는 같은 계열을 재시도하지 않는다.
 
 **R11 인사이트**: append-only `-Xptxas -v -warn-spills` 자체는 “compile/codegen 기준선 재고정” 의도였지만, benchmark runtime path에 wrapper flag를 직접 얹는 방식은 5회 순차 median이 `0.015814 ms`로 크게 후퇴해 채택할 수 없었다. 동시에 rollback 후 NCU는 현재 accepted large-batch 경로가 `gdn_decode_kernel<8>`, `Grid Size=2048`, `Duration=31.97 us`, `Issue Slots Busy=21.98%`, `Achieved Occupancy=40.11%`, `Registers/thread=56`, spill `0`임을 다시 보여 줬다. 다음 기준선 고정 작업은 benchmark path 밖의 standalone build/objdump로 옮기고, 실제 kernel-side 후보는 B2/H2 block-wide async pipeline이나 A5 `missProp=Streaming`처럼 Duration을 직접 건드리는 안으로 좁히는 편이 낫다.
+
+**R12 인사이트**: current accepted `gdn_decode_kernel<8>` large-batch path에 2-stage `cp.async` shared double-buffer를 붙인 standalone async staging도 B=64 decision gate에서 `0.028864 ms`로 후퇴했다. `ROWS_PER_WARP=8` path는 현재 4-row stage가 두 번뿐이라 register pressure 완화보다 commit/wait + shared round-trip cost가 더 크게 작용했고, 같은 current-kernel<8> async fetch 치환은 더 깊은 pipeline이나 q/k 중복 제거와 결합되지 않는 한 우선순위를 낮춘다.
 
 ### Phase 3+ 기록 템플릿
 

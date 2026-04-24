@@ -472,3 +472,17 @@ Key NCU fields to compare:
   - B2/H2 block-wide async pipeline: current `gdn_decode_kernel<8>` large-batch path의 low-issue / bytes-in-flight 부족을 직접 건드리는 방향.
   - A5 standalone (`missProp=Streaming`): kernel body 무변경으로 memory policy만 조정하는 저위험 host-side 후보.
   - codegen 기준선 재고정의 분리 실행: wrapper flag를 benchmark path에 넣지 말고 standalone build/objdump 경로로 옮겨 `56 regs`, spill `0`, 실제 load opcode를 먼저 고정할 것.
+
+## [FAILED iter #2] 2026-04-24
+
+- 승인안: `batch_size >= 32` current `gdn_decode_kernel<8>` path만 대상으로 state fetch를 shared-memory async staging으로 교체.
+- 구현: small-batch path는 유지하고, `ROWS_PER_WARP=8` large-batch path에 2-stage `cp.async` shared double-buffer (`4 rows + 4 rows`) 전용 커널을 추가해 state load를 register prefetch 대신 shared staging으로 바꿨다.
+- 패킹: 성공.
+- 측정:
+  - 명령: `/opt/homebrew/Caskroom/miniforge/base/envs/fi-bench/bin/modal run scripts/run_modal.py --quick --workload-uuid-prefixes eaf0a285`
+  - 결과: `PASSED`, `avg latency = 0.028864 ms`
+- 판정: approved PM gate 기준으로 핵심 B=64 workload가 recent accepted range(`~0.021~0.024 ms`)보다 명확히 느려 full 5회 benchmark와 NCU profiling은 생략하고 즉시 롤백했다. `solution/cuda/kernel.cu`는 백업본 기준으로 복원했다.
+- 추정 원인:
+  - current `gdn_decode_kernel<8>` path는 4-row stage가 두 번뿐이라 async depth가 너무 얕다.
+  - `cp.async` commit/wait와 shared round-trip 비용이 register pressure 완화 이득을 상쇄했다.
+  - 즉, standalone state-fetch 치환만으로는 current low-issue / reg-limited occupancy 병목을 못 움직였다.
