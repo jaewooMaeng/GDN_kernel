@@ -391,3 +391,21 @@ Key NCU fields to compare:
   - B1 2-CTA cluster q/k 공유: `V_PER_Q=2` 중복 q/k read와 qk_dot 중복 자체를 줄이는 방향이라 이번 실패 이유와 직접 맞물린다.
   - A2/A3 저위험 메모리 힌트 (`cuda::annotated_ptr`, read-only load path 확인): current kernel shape를 바꾸지 않고 state/qk read path를 다듬는 방향.
   - G5 + SASS/ptxas 기준선 재고정: accepted kernel의 `Registers/thread=56`, spill 0, `LDG/FFMA/SHFL` 비율을 먼저 고정해 다음 구조 변경의 실패 이유를 더 명확히 볼 것.
+
+## iter #1 (2026-04-24 session)
+
+- 적용한 최적화: (1) C2 재시도 성격으로 hot loop warp reduction을 inline PTX `redux.sync.add.f32`로 바꾸려 했으나 Modal CUDA 13.0 `ptxas`가 `.add.f32`를 거부해 compile blocked, (2) fallback으로 `state` base pointer에 `cuda::associate_access_property(..., cuda::access_property::persisting{})` 힌트를 주는 A2 계열 저위험 memory-hint를 시도했으나 첫 full benchmark에서 regression이 커 전체 롤백함.
+- 측정된 avg latency: 1차는 build failure로 수치 없음. 2차 fallback은 1회 `0.018830 ms`, correctness `PASSED=54/54`; 핵심 B=64 workload `eaf0a285`는 `0.029457 ms`. accepted baseline latency는 롤백 후 `0.012920 ms`를 유지한다.
+- NCU Duration: 롤백 후 현재 accepted kernel 기준 `32.51 us`.
+- 남아있는 주요 bottleneck: rollback 후 profiled kernel은 `Grid Size=1024`, `Waves/SM=0.77`, `Issue Slots Busy=17.78%`, `Memory Throughput=29.37%`, `DRAM Throughput=24.10%`, `L1/TEX Throughput=49.83%`, `L2 Throughput=20.12%`, `Achieved Occupancy=28.79%`, `Registers/thread=56`, local spilling `0`, `L1 hit=5.37%`, `L2 hit=1.52%`다. 여전히 small-grid / low-issue / register-limited occupancy / poor-cache-hit 성격이 강하다.
+- 이번에 시도했거나 검토했지만 안 좋다고 판단한 방향:
+  - 후보: C2 inline PTX `redux.sync.add.f32`.
+  - 안 좋은 이유: 공식 PTX ISA 9.2 문서에는 `.f32` 지원 메모가 보이지만, 실제 Modal CUDA 13.0 `ptxas`는 `Incorrect type '.f32' for operation '.add' in instruction 'redux'`로 전 workload compile failure를 냈다. 현재 toolchain에서는 float warp-reduce add 경로가 막혀 있다고 보는 편이 맞다.
+  - 재시도 가능 조건: Modal/toolkit 쪽 `ptxas`가 `redux.sync.add.f32`를 실제로 수용하는 버전으로 올라가거나, SASS/ptxas 기준으로 동등한 float warp-reduce primitive가 검증될 때.
+  - 후보: A2 계열 state access-property persisting hint 단독 적용.
+  - 안 좋은 이유: 구조를 전혀 바꾸지 않은 저위험 힌트였지만 full benchmark avg가 `0.018830 ms`로 baseline `0.012920 ms`보다 크게 악화됐고, B=64 `eaf0a285`도 `0.029457 ms`로 baseline(`0.021~0.022 ms`)보다 훨씬 느려졌다. standalone cache-hint만으로는 current bottleneck을 못 움직였고 오히려 load path가 불리해졌을 가능성이 크다.
+  - 재시도 가능 조건: 단독 재시도는 하지 않음. 향후 재검토하더라도 `missProp=Streaming`, `__ldg()/ld.global.nc` 검증, 또는 B1처럼 q/k 중복 제거와 결합된 더 큰 메모리 경로 변경 안에서만 본다.
+- 다음 iteration 에서 시도할만한 후보 2~3 개:
+  - B1 2-CTA cluster q/k 공유: 현재 repeated failure의 공통 원인인 q/k load 및 qk reduction 중복을 직접 줄이는 방향.
+  - A3/A4 read-only load path 검증 (`__ldg`, `ld.global.nc.v4.f32`) + SASS 확인: 단, standalone cache-hint 재시도 대신 실제 load opcode 변화가 보일 때만.
+  - G5 ptxas/SASS 기준선 재고정: `Registers/thread=56`, spill 0, `LDG/FFMA/SHFL` 비율을 먼저 고정해 다음 구조 변경의 성공/실패 이유를 더 분명히 볼 것.

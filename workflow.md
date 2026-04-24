@@ -192,7 +192,7 @@ setmaxnreg.inc.sync.aligned.u32 N / setmaxnreg.dec.sync.aligned.u32 N
 **참조**: NVIDIA CUDA Programming Guide "L2 Persistence" 섹션, CUDA SDK sample `graphMemoryFootprint`, libcu++ `<cuda/annotated_ptr>` 공식 예제.
 
 - [x] **A1. L2 Persistence + hitRatio 공식 + max set-aside** [적용됨, host code]: `hitRatio = min(persistingL2CacheMaxSize / total_state_bytes, 1.0f)`, `cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, prop.persistingL2CacheMaxSize)`, `hitProp=Persisting`, `missProp=Normal`. 현재 `setup_l2_persistence()`에서 (stream, ptr, bytes) 캐싱으로 중복 호출 방지.
-- [ ] **A2. `cuda::annotated_ptr<float, cuda::access_property::persisting>`로 state 래핑**: 커널 내부에서 포인터 단위 hint. Stream attribute보다 정교. miss 경로는 `access_property::streaming` 으로 분리 가능.
+- [ ] **A2. `cuda::annotated_ptr<float, cuda::access_property::persisting>`로 state 래핑**: 커널 내부에서 포인터 단위 hint. Stream attribute보다 정교. miss 경로는 `access_property::streaming` 으로 분리 가능. **[시도됨 2026-04-24 session iter #1, 후퇴]** `cuda::associate_access_property(..., persisting)` 기반의 축소 버전을 state base pointer에만 적용했지만 full benchmark avg가 `0.018830 ms`로 baseline `0.012920 ms`보다 크게 악화됐고, B=64 `eaf0a285`도 `0.029457 ms`로 후퇴했다. standalone cache-hint 단독안은 재시도하지 않고, 향후에는 `missProp=Streaming`, `__ldg/ld.global.nc`, 또는 B1 같은 구조적 중복 제거와 결합될 때만 검토.
 - [ ] **A3. State read를 `__ldg()`로 명시**: read-only path 강제. `__restrict__` + nvcc 자동 생성 여부를 `cuobjdump --dump-sass`로 `LDG.E.128.CONSTANT` 확인 후 미생성이면 명시. `float4` 로드와 결합 시 `ld.global.nc.v4.f32`.
 - [ ] **A4. `ld.global.nc.v4.f32` inline PTX**: A3이 자동 생성 안 될 때 non-coherent cache path 강제. 
   ```
@@ -238,7 +238,7 @@ setmaxnreg.inc.sync.aligned.u32 N / setmaxnreg.dec.sync.aligned.u32 N
 **참조**: CUDA Math API 문서 (`__fmaf_rn`, `__reduce_add_sync`), PTX ISA `redux.sync`, `wgmma.mma_async`.
 
 - [x] **C1. Gate 계산 lane 0 집중 + shuffle broadcast** [적용됨 Iter 20]: SFU throughput 경쟁 해소, Phase 2 break-through.
-- [ ] **C2. `__reduce_add_sync()` intrinsic으로 warp reduction 대체**: 현재 5-stage `__shfl_down_sync` butterfly. SM100 native `redux.sync.add.f32` 1-instruction. `-arch=sm_100a` 필수. PTX `redux.sync` 생성 확인. **[시도됨 iter #3, build blocked]** 현재 Modal `tvm_ffi`/nvcc 경로에서는 `__reduce_add_sync(float)` overload가 보이지 않아 전 workload compile failure가 났다. inline PTX `redux.sync.add.f32` 또는 다른 toolchain에서 overload/SASS를 확인할 때만 재시도.
+- [ ] **C2. `__reduce_add_sync()` intrinsic으로 warp reduction 대체**: 현재 5-stage `__shfl_down_sync` butterfly. SM100 native `redux.sync.add.f32` 1-instruction. `-arch=sm_100a` 필수. PTX `redux.sync` 생성 확인. **[시도됨 iter #3, build blocked; 재시도됨 2026-04-24 session iter #1, inline PTX도 blocked]** 현재 Modal `tvm_ffi`/nvcc 경로에서는 `__reduce_add_sync(float)` overload가 보이지 않아 전 workload compile failure가 났고, inline PTX `redux.sync.add.f32`도 CUDA 13.0 `ptxas`에서 `Incorrect type '.f32' for operation '.add'`로 거부됐다. Modal toolchain에서 float warp-reduce add 지원이 실제로 확인되기 전에는 재시도하지 않는다.
 - [ ] **C3. 명시적 FMA (`__fmaf_rn()`)**: 현재 dot product / state update가 nvcc FMA 자동 생성 의존. PTX 생성 물(FFMA vs FADD+FMUL) 검증 후 미생성 구간 명시적 호출.
 - [ ] **C4. k_vals/q_vals를 `float4` 자료형으로 유지**: 현재 개별 float 배열. `float4 k4, q4;`로 보관 → nvcc FFMA4 자동 생성 유도, state `float4`와 layout 일치.
 - [ ] **C5. Output 계산 fusion 추가**: `scale_g * qs_x + scale_qk * res_x` 이미 pre-computed 상수 활용. 추가 여지 낮음.
@@ -410,6 +410,7 @@ B200 SM ≈ 148:
 | R4 | `kernel.cu` host launch path 수동 CUDA Graph replay | 0.014014 avg / 0.017512 retry | 롤백 |
 | R5 | RPW=16 warp-private `__pipeline_memcpy_async` + `sm_100a` JIT flags | 0.013124 avg | 롤백 |
 | R6 | `B>=32` 전용 256-thread / 8-warp large-batch path | 0.012979 avg | 롤백 |
+| R7 | inline PTX `redux.sync.add.f32` blocked, fallback state access-property persisting | 0.018830 avg | 롤백 |
 
 **핵심 인사이트 (Iter 20)**: 32 lanes 동시 exp/log1p → SFU throughput 심각 경쟁. Lane 0 전담 + 3 shuffle로 SFU 경쟁 완전 제거 = Phase 2 break-through.
 
@@ -424,6 +425,8 @@ B200 SM ≈ 148:
 **R5 인사이트**: `ROWS_PER_WARP=16` large-batch 경로만 골라 warp-private `__pipeline_memcpy_async` 2-stage prefetch를 넣어도 benchmark는 개선되지 않았다. correctness는 유지됐지만 full benchmark avg가 `0.013124 ms`로 baseline `0.012920 ms`보다 느려졌고, B=64 `eaf0a285`도 `0.024348 ms`로 후퇴했다. per-thread async copy + shared reload + commit/wait overhead가 기존 register prefetch보다 비싸서 overlap 이득을 상쇄한 것으로 보인다. 다음 async 계열 재시도는 block/warp 단위 `cuda::pipeline` 또는 `cp.async`로 bytes-in-flight를 더 키우거나, B1처럼 중복 q/k work 제거와 결합할 때만 검토한다.
 
 **R6 인사이트**: `batch_size >= 32` large-batch path만 256-thread / 8-warp로 키워 per-CTA parallelism을 늘려도 benchmark는 개선되지 않았다. 전체 avg가 `0.012979 ms`로 baseline `0.012920 ms`보다 소폭 나빠졌고, 핵심 타깃 B=64 `eaf0a285`는 `0.023968 ms`로 baseline(`0.021~0.022 ms`)보다 느려졌다. standalone 256-thread 확대만으로는 q/k load와 qk reduction의 warp 중복, `ROWS_PER_WARP=8`로 줄어든 per-warp ILP를 상쇄하지 못했다. 다음 large-batch 재시도는 q/k shared/cluster 공유처럼 warp 중복 제거와 결합될 때만 검토한다.
+
+**R7 인사이트**: C2의 inline PTX 경로까지 시도했지만 현재 Modal CUDA 13.0 `ptxas`는 `redux.sync.add.f32`를 실제로 수용하지 않았다. 또한 A2 성격의 standalone state access-property persisting 힌트는 full benchmark avg를 `0.018830 ms`까지 악화시켰다. 현재 단계에서는 문서상 가능성만 있는 float warp-reduce/soft cache-hint보다, load opcode를 실제로 바꾸는 A3/A4 검증이나 q/k 중복 제거(B1)처럼 보다 구조적인 변화가 우선이다.
 
 ### Phase 3+ 기록 템플릿
 
