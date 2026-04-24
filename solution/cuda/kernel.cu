@@ -117,10 +117,10 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 9) gdn_decode_kernel(
     const int vi_start = split_id * ROWS_PER_BLOCK + warp_id * ROWS_PER_WARP;
     const int lane4 = lane << 2;
 
-    float4 pf_a = *reinterpret_cast<const float4*>(state_base + vi_start * HEAD_DIM + lane4);
-    float4 pf_b = *reinterpret_cast<const float4*>(state_base + (vi_start + 1) * HEAD_DIM + lane4);
-    float4 pf_c = *reinterpret_cast<const float4*>(state_base + (vi_start + 2) * HEAD_DIM + lane4);
-    float4 pf_d = *reinterpret_cast<const float4*>(state_base + (vi_start + 3) * HEAD_DIM + lane4);
+    float4 pf_a = __ldg(reinterpret_cast<const float4*>(state_base + vi_start * HEAD_DIM + lane4));
+    float4 pf_b = __ldg(reinterpret_cast<const float4*>(state_base + (vi_start + 1) * HEAD_DIM + lane4));
+    float4 pf_c = __ldg(reinterpret_cast<const float4*>(state_base + (vi_start + 2) * HEAD_DIM + lane4));
+    float4 pf_d = __ldg(reinterpret_cast<const float4*>(state_base + (vi_start + 3) * HEAD_DIM + lane4));
 
     #pragma unroll
     for (int vi_off = 0; vi_off < ROWS_PER_WARP; vi_off += 4) {
@@ -132,10 +132,10 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 9) gdn_decode_kernel(
         float4 st4_d = pf_d;
 
         if (vi_off + 4 < ROWS_PER_WARP) {
-            pf_a = *reinterpret_cast<const float4*>(state_base + (vi_a + 4) * HEAD_DIM + lane4);
-            pf_b = *reinterpret_cast<const float4*>(state_base + (vi_a + 5) * HEAD_DIM + lane4);
-            pf_c = *reinterpret_cast<const float4*>(state_base + (vi_a + 6) * HEAD_DIM + lane4);
-            pf_d = *reinterpret_cast<const float4*>(state_base + (vi_a + 7) * HEAD_DIM + lane4);
+            pf_a = __ldg(reinterpret_cast<const float4*>(state_base + (vi_a + 4) * HEAD_DIM + lane4));
+            pf_b = __ldg(reinterpret_cast<const float4*>(state_base + (vi_a + 5) * HEAD_DIM + lane4));
+            pf_c = __ldg(reinterpret_cast<const float4*>(state_base + (vi_a + 6) * HEAD_DIM + lane4));
+            pf_d = __ldg(reinterpret_cast<const float4*>(state_base + (vi_a + 7) * HEAD_DIM + lane4));
         }
 
         float ks_a = k_vals[0]*st4_a.x + k_vals[1]*st4_a.y + k_vals[2]*st4_a.z + k_vals[3]*st4_a.w;

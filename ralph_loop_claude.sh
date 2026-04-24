@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # =============================================================================
-# ralph_loop.sh — Codex 기반 CUDA 커널 최적화 무한 루프
+# ralph_loop_claude.sh — Claude Code(`claude -p`) 기반 CUDA 커널 최적화 무한 루프
 #
 #   종료 조건   : avg latency < ${TARGET_LATENCY_MS} ms
 #   보조 목표   : NCU Duration 감소
-#   iteration   : (1) plan+PM 전용 codex → plan.md 에 APPROVED
-#                 (2) 구현+bench+NCU (단일 인스턴스 락, codex 로그는 짧게 유지)
+#   iteration   : (1) plan+PM 전용 Claude → plan.md 에 APPROVED
+#                 (2) 구현+bench+NCU (단일 인스턴스 락, claude 로그는 짧게 유지)
 #   세션 수명   : 30분 동안 로그 갱신 없으면 kill 후 새 세션
 #   세션 성공 후: git commit
-#   승인 정책   : codex의 모든 approval 자동 수락
+#   승인 정책   : --dangerously-skip-permissions (env 의 CLAUDE_FLAGS 로 override)
 # =============================================================================
 set -uo pipefail
 
@@ -20,13 +20,15 @@ MAX_ITERATIONS="${MAX_ITERATIONS:-1000}"              # 안전 상한
 MAX_CONSECUTIVE_SESSION_FAILURES="${MAX_CONSECUTIVE_SESSION_FAILURES:-3}"
 SESSION_FAILURE_SLEEP_SEC="${SESSION_FAILURE_SLEEP_SEC:-10}"
 MAX_PLAN_RETRIES="${MAX_PLAN_RETRIES:-3}"
-STATE_DIR="${STATE_DIR:-ralph_state}"
-LOGS_DIR="${LOGS_DIR:-ralph_logs}"
-# per-phase codex 로그(ralph_logs/iter_*/codex_*.log)이 이 바이트를 넘기면 끝부분만 유지
-CODEX_LOG_MAX_BYTES="${CODEX_LOG_MAX_BYTES:-65536}"
+# codex 루프와 병행 시 겹치지 않게 기본값을 분리
+STATE_DIR="${STATE_DIR:-ralph_state_claude}"
+LOGS_DIR="${LOGS_DIR:-ralph_logs_claude}"
+# per-phase claude 로그(ralph_logs_claude/iter_*/claude_*.log)이 이 바이트를 넘기면 끝부분만 유지
+CLAUDE_LOG_MAX_BYTES="${CLAUDE_LOG_MAX_BYTES:-65536}"
 WORKFLOW_FILE="${WORKFLOW_FILE:-workflow.md}"
-CODEX_BIN="${CODEX_BIN:-codex}"
-CODEX_FLAGS="${CODEX_FLAGS:---dangerously-bypass-approvals-and-sandbox --skip-git-repo-check}"
+CLAUDE_BIN="${CLAUDE_BIN:-claude}"
+# Codex 루프의 --dangerously-bypass-... 에 대응: 권한 프롬프트 스킵 (필요 시 --bare 등 추가)
+CLAUDE_FLAGS="${CLAUDE_FLAGS:---dangerously-skip-permissions}"
 
 DEFAULT_PYTHON_BIN="/opt/homebrew/Caskroom/miniforge/base/envs/fi-bench/bin/python"
 DEFAULT_MODAL_BIN="/opt/homebrew/Caskroom/miniforge/base/envs/fi-bench/bin/modal"
@@ -37,20 +39,20 @@ MODAL_BIN="${MODAL_BIN:-$DEFAULT_MODAL_BIN}"
 NCU_WORKLOAD_UUID="${NCU_WORKLOAD_UUID:-eaf0a285-447c-4432-8e68-d287acc3cb08}"
 NCU_SET="${NCU_SET:-detailed}"
 
-LATENCY_FILE="$STATE_DIR/latest_latency.txt"          # codex 가 avg latency 를 기록
+LATENCY_FILE="$STATE_DIR/latest_latency.txt"          # 에이전트가 avg latency 를 기록
 PROFILE_LOG="${PROFILE_LOG:-log.md}"                  # NCU/분석 (append·장문 OK; 토큰 절약은 state/logs 쪽)
 PLAN_FILE="$STATE_DIR/plan.md"                        # plan+PM 단계 산출 (문자열 APPROVED 필수)
 NCU_DURATION_FILE="$STATE_DIR/latest_ncu_duration_us.txt"
 ITER_METRICS_FILE="$STATE_DIR/iter_metrics.tsv"
-RALPH_LOCK_DIR="$STATE_DIR/ralph_loop_lock"
+RALPH_LOCK_DIR="$STATE_DIR/ralph_loop_claude_lock"
 RALPH_LOCK_HELD=0
 
 mkdir -p "$STATE_DIR" "$LOGS_DIR"
 
 # ---------- 유틸 --------------------------------------------------------------
-log()  { printf '\033[1;36m[ralph %s]\033[0m %s\n' "$(date '+%F %T')" "$*"; }
-warn() { printf '\033[1;33m[ralph %s] WARN:\033[0m %s\n' "$(date '+%F %T')" "$*"; }
-die()  { printf '\033[1;31m[ralph %s] FATAL:\033[0m %s\n' "$(date '+%F %T')" "$*"; exit 1; }
+log()  { printf '\033[1;36m[ralph-claude %s]\033[0m %s\n' "$(date '+%F %T')" "$*"; }
+warn() { printf '\033[1;33m[ralph-claude %s] WARN:\033[0m %s\n' "$(date '+%F %T')" "$*"; }
+die()  { printf '\033[1;31m[ralph-claude %s] FATAL:\033[0m %s\n' "$(date '+%F %T')" "$*"; exit 1; }
 
 file_mtime() {
     stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0
@@ -64,7 +66,7 @@ fi
 acquire_lock() {
     mkdir -p "$STATE_DIR" || die "STATE_DIR 생성 실패"
     if ! mkdir "$RALPH_LOCK_DIR" 2>/dev/null; then
-        die "락 획득 실패: 다른 ralph_loop 가 실행 중 ($RALPH_LOCK_DIR)"
+        die "락 획득 실패: 다른 ralph_loop_claude 가 실행 중 ($RALPH_LOCK_DIR)"
     fi
     RALPH_LOCK_HELD=1
 }
@@ -75,7 +77,7 @@ release_lock() {
     RALPH_LOCK_HELD=0
 }
 
-command -v "$CODEX_BIN" >/dev/null 2>&1 || die "codex 바이너리를 찾을 수 없음: $CODEX_BIN"
+command -v "$CLAUDE_BIN" >/dev/null 2>&1 || die "claude 바이너리를 찾을 수 없음: $CLAUDE_BIN"
 command -v git         >/dev/null 2>&1 || warn "git 이 없음 — commit 단계가 skip 됨"
 command -v "$PYTHON_BIN" >/dev/null 2>&1 || warn "python 실행 파일 확인 실패: $PYTHON_BIN"
 command -v "$MODAL_BIN"  >/dev/null 2>&1 || warn "modal 실행 파일 확인 실패: $MODAL_BIN"
@@ -107,9 +109,9 @@ check_plan_approved() {
     grep -qi 'APPROVED' "$PLAN_FILE"
 }
 
-compact_codex_log_file() {
+compact_claude_log_file() {
     local f="$1"
-    local maxb="${CODEX_LOG_MAX_BYTES:-65536}"
+    local maxb="${CLAUDE_LOG_MAX_BYTES:-65536}"
     [[ -f "$f" ]] || return 0
     local sz
     sz=$(wc -c < "$f" 2>/dev/null | tr -d ' ' || echo 0)
@@ -120,7 +122,7 @@ compact_codex_log_file() {
     fi
 }
 
-# ---------- Codex 프롬프트 (phase: plan | impl) -------------------------------
+# ---------- Claude 프롬프트 (phase: plan | impl) --------------------------------
 build_prompt_plan() {
     local iter="$1"
     local pack_cmd="$PYTHON_BIN scripts/pack_solution.py"
@@ -203,60 +205,64 @@ NCU 출력의 Duration(us) 숫자만 아래 파일에도 덮어써라:
 =========================================================
 실행 규칙
 =========================================================
-- 필요한 모든 쉘 명령을 네가 직접 실행해라. 어떤 승인 요청이 떠도 모두 YES 로 진행.
+- 필요한 모든 쉘 명령을 네가 직접 실행해라. 권한/도구 승인이 필요하면 --dangerously-skip-permissions 가 이미 켜져 있어야 한다(아니면 스크립트의 CLAUDE_FLAGS 를 조정).
 - 중요한 결정은 한국어로 간결히 설명한다.
 - 단계 경계마다 한두 줄짜리 체크포인트를 콘솔에 남긴다.
 - 종료 조건(< ${TARGET_LATENCY_MS} ms)을 이번 iteration 에 이미 달성했다면, 불필요한 추가 변경 없이 마무리한다.
 EOF
 }
 
-# ---------- Codex 세션 + idle watchdog (세션 끝에 로그 tail 압축) ------------
-run_codex_phase() {
+# ---------- Claude Code (`claude -p`) 세션 + idle watchdog (세션 끝에 로그 tail 압축) --
+run_claude_phase() {
     local iter="$1"
     local phase="$2"
     local iter_dir="$LOGS_DIR/iter_$(printf '%04d' "$iter")"
     mkdir -p "$iter_dir"
-    local session_log="$iter_dir/codex_${phase}.log"
+    local session_log="$iter_dir/claude_${phase}.log"
     local prompt_file="$iter_dir/prompt_${phase}.txt"
 
     case "$phase" in
         plan) build_prompt_plan "$iter" > "$prompt_file" ;;
         impl) build_prompt_impl "$iter"  > "$prompt_file" ;;
-        *) die "run_codex_phase: 잘못된 phase: $phase" ;;
+        *) die "run_claude_phase: 잘못된 phase: $phase" ;;
     esac
     : > "$session_log"
     touch "$session_log"
 
-    log "iter #$iter → codex 세션 시작 ($phase)"
+    log "iter #$iter → claude -p 세션 시작 ($phase)"
     log "    prompt: $prompt_file"
     log "    log   : $session_log"
 
     # shellcheck disable=SC2086
     if command -v setsid >/dev/null 2>&1; then
         if (( USE_STDBUF )); then
-            setsid stdbuf -oL -eL "$CODEX_BIN" exec $CODEX_FLAGS \
+            setsid stdbuf -oL -eL "$CLAUDE_BIN" -p \
                 "$(cat "$prompt_file")" \
+                $CLAUDE_FLAGS \
                 >>"$session_log" 2>&1 &
         else
-            setsid "$CODEX_BIN" exec $CODEX_FLAGS \
+            setsid "$CLAUDE_BIN" -p \
                 "$(cat "$prompt_file")" \
+                $CLAUDE_FLAGS \
                 >>"$session_log" 2>&1 &
         fi
     else
         if (( USE_STDBUF )); then
-            stdbuf -oL -eL "$CODEX_BIN" exec $CODEX_FLAGS \
+            stdbuf -oL -eL "$CLAUDE_BIN" -p \
                 "$(cat "$prompt_file")" \
+                $CLAUDE_FLAGS \
                 >>"$session_log" 2>&1 &
         else
-            "$CODEX_BIN" exec $CODEX_FLAGS \
+            "$CLAUDE_BIN" -p \
                 "$(cat "$prompt_file")" \
+                $CLAUDE_FLAGS \
                 >>"$session_log" 2>&1 &
         fi
     fi
-    local codex_pid=$!
+    local claude_pid=$!
 
     (
-        while kill -0 "$codex_pid" 2>/dev/null; do
+        while kill -0 "$claude_pid" 2>/dev/null; do
             sleep "$POLL_INTERVAL_SEC"
             local mtime now idle
             mtime=$(file_mtime "$session_log")
@@ -264,18 +270,18 @@ run_codex_phase() {
             idle=$(( now - mtime ))
             if (( idle > IDLE_TIMEOUT_SEC )); then
                 echo "" >> "$session_log"
-                echo "[watchdog] ${idle}s 동안 로그 갱신 없음 → codex 세션 강제 종료" \
+                echo "[watchdog] ${idle}s 동안 로그 갱신 없음 → claude -p 세션 강제 종료" \
                     | tee -a "$session_log"
-                if kill -0 -- "-$codex_pid" 2>/dev/null; then
-                    kill -TERM -- "-$codex_pid" 2>/dev/null || true
+                if kill -0 -- "-$claude_pid" 2>/dev/null; then
+                    kill -TERM -- "-$claude_pid" 2>/dev/null || true
                     sleep 5
-                    kill -KILL -- "-$codex_pid" 2>/dev/null || true
+                    kill -KILL -- "-$claude_pid" 2>/dev/null || true
                 else
-                    pkill -TERM -P "$codex_pid" 2>/dev/null || true
-                    kill  -TERM    "$codex_pid" 2>/dev/null || true
+                    pkill -TERM -P "$claude_pid" 2>/dev/null || true
+                    kill  -TERM    "$claude_pid" 2>/dev/null || true
                     sleep 5
-                    pkill -KILL -P "$codex_pid" 2>/dev/null || true
-                    kill  -KILL    "$codex_pid" 2>/dev/null || true
+                    pkill -KILL -P "$claude_pid" 2>/dev/null || true
+                    kill  -KILL    "$claude_pid" 2>/dev/null || true
                 fi
                 exit 0
             fi
@@ -286,7 +292,7 @@ run_codex_phase() {
     tail -n +1 -f "$session_log" &
     local tail_pid=$!
 
-    wait "$codex_pid"
+    wait "$claude_pid"
     local rc=$?
 
     kill "$watchdog_pid" 2>/dev/null || true
@@ -295,8 +301,8 @@ run_codex_phase() {
     kill "$tail_pid" 2>/dev/null || true
     wait "$tail_pid" 2>/dev/null || true
 
-    compact_codex_log_file "$session_log"
-    log "iter #$iter → codex 세션 종료 $phase (exit=$rc)"
+    compact_claude_log_file "$session_log"
+    log "iter #$iter → claude 세션 종료 $phase (exit=$rc)"
     return "$rc"
 }
 
@@ -347,7 +353,7 @@ commit_iteration() {
 
     git add -A
     local msg
-    msg="ralph iter $(printf '%04d' "$iter")"
+    msg="ralph-claude iter $(printf '%04d' "$iter")"
     if [[ -f "$LATENCY_FILE" ]]; then
         local lat
         lat="$(tr -d ' \t\r\n' < "$LATENCY_FILE")"
@@ -372,9 +378,9 @@ trap cleanup EXIT
 trap 'log "SIGINT 수신 → 종료"; exit 130' INT
 trap 'log "SIGTERM 수신 → 종료"; exit 143' TERM
 
-# 루트 검증 끝난 뒤 단일 인스턴스 락(중복 ralph_loop 방지)
+# 루트 검증 끝난 뒤 단일 인스턴스 락(중복 ralph_loop_claude 방지)
 acquire_lock
-log "ralph loop 시작"
+log "ralph loop (Claude) 시작"
 log "    target       : avg_latency < ${TARGET_LATENCY_MS} ms"
 log "    workflow     : ${WORKFLOW_FILE}"
 log "    plan file    : ${PLAN_FILE}"
@@ -385,7 +391,8 @@ log "    idle timeout : ${IDLE_TIMEOUT_SEC} s"
 log "    max iters    : ${MAX_ITERATIONS}"
 log "    plan retries : ${MAX_PLAN_RETRIES}"
 log "    max failures : ${MAX_CONSECUTIVE_SESSION_FAILURES}"
-log "    codex log    : keep last ${CODEX_LOG_MAX_BYTES} bytes per phase"
+log "    claude log   : keep last ${CLAUDE_LOG_MAX_BYTES} bytes per phase"
+log "    claude cmd   : ${CLAUDE_BIN} -p <prompt> <CLAUDE_FLAGS...>"
 
 iter=0
 consecutive_session_failures=0
@@ -404,7 +411,7 @@ while (( iter < MAX_ITERATIONS )); do
     while (( attempt < MAX_PLAN_RETRIES )); do
         attempt=$(( attempt + 1 ))
         log "iter #$iter plan/PM (시도 ${attempt}/${MAX_PLAN_RETRIES})"
-        if run_codex_phase "$iter" plan; then
+        if run_claude_phase "$iter" plan; then
             last_plan_rc=0
         else
             last_plan_rc=$?
@@ -414,7 +421,7 @@ while (( iter < MAX_ITERATIONS )); do
             break
         fi
         if (( last_plan_rc != 0 )); then
-            warn "iter #$iter → plan codex exit=$last_plan_rc"
+            warn "iter #$iter → plan claude exit=$last_plan_rc"
         else
             warn "iter #$iter → ${PLAN_FILE} 에 APPROVED 없음"
         fi
@@ -435,7 +442,7 @@ while (( iter < MAX_ITERATIONS )); do
         continue
     fi
 
-    if run_codex_phase "$iter" impl; then
+    if run_claude_phase "$iter" impl; then
         consecutive_session_failures=0
         if command -v git >/dev/null 2>&1 && \
            [[ -f solution/cuda/kernel.cu ]] && \
@@ -448,7 +455,7 @@ while (( iter < MAX_ITERATIONS )); do
         append_iter_metrics "$iter" "ok"
     else
         consecutive_session_failures=$(( consecutive_session_failures + 1 ))
-        warn "iter #$iter → impl codex 실패, commit skip (연속 실패 $consecutive_session_failures)"
+        warn "iter #$iter → impl claude 실패, commit skip (연속 실패 $consecutive_session_failures)"
         append_iter_metrics "$iter" "impl_session_fail"
         if (( consecutive_session_failures >= MAX_CONSECUTIVE_SESSION_FAILURES )); then
             die "impl 단계를 ${consecutive_session_failures}회 연속 실패하여 루프를 중단"
@@ -464,4 +471,3 @@ done
 
 warn "MAX_ITERATIONS(${MAX_ITERATIONS}) 도달, 루프 종료"
 exit 1
-

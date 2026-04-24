@@ -109,11 +109,11 @@ def run_benchmark(
     """Run benchmark on Modal B200 and return results."""
     if config is None:
         config = BenchmarkConfig(
-            warmup_runs=1,
-            iterations=5,
-            num_trials=3,
+            warmup_runs=3,
+            iterations=100,
+            num_trials=5,
             use_isolated_runner=True,
-            timeout_seconds=300,
+            timeout_seconds=3000,
         )
 
     started_at = time.perf_counter()
