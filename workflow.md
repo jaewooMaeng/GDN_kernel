@@ -267,7 +267,7 @@ setmaxnreg.inc.sync.aligned.u32 N / setmaxnreg.dec.sync.aligned.u32 N
 
 ### E. 공유 메모리 / 레지스터 재분배
 
-- [ ] **E1. q, k를 SMEM에 로드 후 block 내 broadcast**: 현재 128 lane이 독립 로드. Block 내 모든 warp가 동일 q/k 사용하므로 SMEM 1회 로드 + broadcast. Register 절약 → occupancy 향상 여지. SMEM bank broadcast는 conflict-free. **[시도됨 iter #2, 후퇴]** q/k/v를 모두 shared에 staging하고 gate도 block당 1회만 계산하는 축소 버전을 시험했지만 avg latency가 `0.013278 ms`로 악화, B=64 workload `eaf0a285`가 `0.024691 ms`까지 상승. state row streaming이 주병목인 상태에서 shared staging과 block barrier 추가 이득보다 cost가 컸음.
+- [ ] **E1. q, k를 SMEM에 로드 후 block 내 broadcast**: 현재 128 lane이 독립 로드. Block 내 모든 warp가 동일 q/k 사용하므로 SMEM 1회 로드 + broadcast. Register 절약 → occupancy 향상 여지. SMEM bank broadcast는 conflict-free. **[시도됨 iter #2, 후퇴 / 재시도됨 2026-04-24 session iter #3, 후퇴]** 처음에는 q/k/v를 모두 shared에 staging하고 gate도 block당 1회만 계산하는 축소 버전을 시험했지만 avg latency가 `0.013278 ms`로 악화, B=64 workload `eaf0a285`가 `0.024691 ms`까지 상승했다. 이후 `warp0`만 q/k와 block scalar를 준비하고 기존 `s_v` barrier를 재활용하는 재변형도 full benchmark avg가 `0.012932 ms`로 same-day rollback baseline `0.012671 ms`를 넘지 못했다. shared q/k fan-out standalone 계열은 당분간 우선순위를 내리고, SASS로 register 감소나 issue-mix 개선 근거가 있을 때만 다시 본다.
 - [x] **E2. s_v → warp-register + sync 제거** [시도됨 Iter 1, 후퇴].
 - [ ] **E3. s_v를 warp 독립 register + `__shfl_sync` broadcast (sync 유지)**: E2와 구조 다름 — `__syncthreads()`는 유지하되 s_v shared 대신 warp 내 register + shuffle. 구조 차이로 재시도 가치 있음.
 - [ ] **E4. k_vals/q_vals를 SMEM에 staging → ldmatrix.sync.aligned**: Tensor Core 도입(J1) 전 단계로도 유용. `ldmatrix.x4.m8n8.shared.b16` 로 16-bit 텐서 레지스터 분산 로드 실험.
@@ -412,6 +412,7 @@ B200 SM ≈ 148:
 | R6 | `B>=32` 전용 256-thread / 8-warp large-batch path | 0.012979 avg | 롤백 |
 | R7 | inline PTX `redux.sync.add.f32` blocked, fallback state access-property persisting | 0.018830 avg | 롤백 |
 | R8 | `B>=32` compile-time 2-CTA cluster q/k 공유 | 0.018499 avg | 롤백 |
+| R9 | `warp0` q/k shared stage + CTA scalar dedup (all paths) | 0.012932 avg / rollback baseline 0.012671 avg | 롤백 |
 
 **핵심 인사이트 (Iter 20)**: 32 lanes 동시 exp/log1p → SFU throughput 심각 경쟁. Lane 0 전담 + 3 shuffle로 SFU 경쟁 완전 제거 = Phase 2 break-through.
 
@@ -430,6 +431,8 @@ B200 SM ≈ 148:
 **R7 인사이트**: C2의 inline PTX 경로까지 시도했지만 현재 Modal CUDA 13.0 `ptxas`는 `redux.sync.add.f32`를 실제로 수용하지 않았다. 또한 A2 성격의 standalone state access-property persisting 힌트는 full benchmark avg를 `0.018830 ms`까지 악화시켰다. 현재 단계에서는 문서상 가능성만 있는 float warp-reduce/soft cache-hint보다, load opcode를 실제로 바꾸는 A3/A4 검증이나 q/k 중복 제거(B1)처럼 보다 구조적인 변화가 우선이다.
 
 **R8 인사이트**: `batch_size >= 32` 경로만 compile-time 2-CTA cluster로 바꿔 rank 0 CTA의 distributed shared memory `q/k` staging을 pair-CTA가 재사용하게 해도 benchmark는 크게 악화됐다. full benchmark avg가 `0.018499 ms`로 baseline `0.012920 ms`보다 크게 느려졌고, 핵심 B=64 `eaf0a285`도 `0.029220 ms`까지 상승했다. minimal cluster q/k-share-only 안은 cluster barrier와 remote shared read overhead를 상쇄하지 못했으므로, 다음 cluster 재시도는 qk reduction 1회화 또는 async producer/consumer와 결합되는 더 강한 구조 변경일 때만 검토한다.
+
+**R9 인사이트**: E1 계열을 더 좁혀 `warp0`만 q/k와 block-invariant scalar를 준비하고 기존 `s_v` barrier로 CTA 전체에 배포하는 변형까지 시도했지만, same-day baseline full benchmark를 넘지 못했다. full avg는 `0.012932 ms`였고 rollback 후 accepted baseline은 `0.012671 ms`였다. extra barrier를 제거해도 shared q/k fan-out cost가 남았고, standalone CTA-local q/k dedup만으로는 current kernel의 low-issue / small-grid 병목을 충분히 움직이지 못했다.
 
 ### Phase 3+ 기록 템플릿
 

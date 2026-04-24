@@ -424,3 +424,21 @@ Key NCU fields to compare:
   - A3/A4 read-only state load path 검증 (`__ldg`, `ld.global.nc.v4.f32`) + SASS 확인: standalone cache-hint 대신 실제 load opcode 변화가 보이는 방향.
   - C3/C4 FFMA 유도 (`__fmaf_rn`, `float4 q/k` 유지)로 hot loop issue slots를 소폭 끌어올리는 방향.
   - G5 + SASS/ptxas 기준선 재고정: accepted kernel의 `Registers/thread=56`, spill 0, `LDG/FFMA/SHFL` 비율을 먼저 고정하고 다음 구조 변경 리스크를 줄일 것.
+
+## iter #3 (2026-04-24 session)
+
+- 적용한 최적화: 기존 `__syncthreads()`를 재활용하는 E1 재변형. `warp0`만 `q/k`를 `float4` shared staging으로 1회 적재하고 `qk_dot`, `g`, `beta`, `beta_g`도 block당 1회만 계산해 CTA 전체가 재사용하도록 변경했다. 이후 `ROWS_PER_WARP=16` large-batch path는 accepted baseline body로 되돌린 혼합 dispatch도 단일 workload로 스크리닝했다.
+- 측정된 avg latency: all-path staged variant full benchmark 1회 `0.012932 ms`, correctness `PASSED=54/54`. rollback 후 accepted baseline full benchmark 1회는 `0.012671 ms`, `eaf0a285`는 `0.023563 ms`였다. staged family는 baseline을 넘지 못해 전체 롤백했다.
+- NCU Duration: rollback 후 current accepted kernel 기준 `33.31 us`.
+- 남아있는 주요 bottleneck: current accepted kernel NCU는 `Grid Size=1024`, `Waves/SM=0.77`, `Issue Slots Busy=17.33%`, `Memory Throughput=28.62%`, `DRAM Throughput=23.73%`, `L1/TEX Throughput=48.31%`, `L2 Throughput=19.69%`, `Achieved Occupancy=31.70%`, `Registers/thread=56`, local spilling `0`, `L1 hit=5.37%`, `L2 hit=1.51%`다. 여전히 single-pipeline saturation이 아니라 small-grid / low-issue / register-limited occupancy / poor-cache-hit 성격이 핵심이다.
+- 이번에 시도했거나 검토했지만 안 좋다고 판단한 방향:
+  - 후보: all-path `warp0` q/k shared stage + CTA-wide scalar dedup.
+  - 안 좋은 이유: 이전 E1 실패 원인인 “추가 barrier”는 제거했지만, q/k shared fan-out와 warp0 setup cost가 full suite에서는 여전히 이득을 만들지 못했다. full avg가 `0.012932 ms`로 same-day rollback baseline `0.012671 ms`보다 느렸고, B=64 구간도 baseline full run 기준 `0.023563 ms`보다 개선 증거를 만들지 못했다.
+  - 재시도 가능 조건: ptxas/SASS로 실제 register 감소나 `LDG/FFMA/SHFL` mix 개선이 확인되거나, small-batch 전용 dispatch를 full 54-workload/5회 median으로 검증할 수 있을 때.
+  - 후보: `ROWS_PER_WARP=4/8` small-batch 전용 staged dispatch.
+  - 안 좋은 이유: isolated `eaf0a285` probe만으로는 Modal 노이즈가 커 large-path 보호가 확보됐는지 확증하지 못했다. parent all-path variant가 same-day baseline full에 이미 패배한 상태라 이번 iteration에서는 추가 full cycle을 투자할 근거가 약했다.
+  - 재시도 가능 조건: small-batch subset과 full suite를 분리한 저비용 screening path를 먼저 고정하거나, large-batch path가 byte-for-byte identical baseline임을 빌드 산출물로 확인할 수 있을 때.
+- 다음 iteration 에서 시도할만한 후보 2~3 개:
+  - A3/A4 read-only state load path 검증 (`__ldg`, `ld.global.nc.v4.f32`) + SASS 확인: shared fan-out 대신 실제 load opcode를 바꾸는 방향.
+  - G5 기준선 재고정: accepted kernel에 `-Xptxas -v -warn-spills`를 안전하게 주입해 register/spill/SASS mix를 확보한 뒤 다음 변형의 실패 원인을 더 명확히 볼 것.
+  - C3/C4 미시적 FFMA 유도 (`__fmaf_rn`, `float4` dot helper): CTA 구조는 유지하고 hot loop instruction mix만 줄이는 방향.
