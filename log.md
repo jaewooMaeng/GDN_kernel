@@ -532,3 +532,20 @@ Key NCU fields to compare:
   - A5 standalone `missProp=Streaming`: kernel body 무변경 host-side 실험으로 좁고 저위험하게 확인.
   - A3/A4 read-only state load path 검증 (`__ldg`, `ld.global.nc.v4.f32`) + SASS 확인: 실제 state load opcode 변화가 보이는 방향만 시도.
   - benchmark path 밖 codegen 기준선 재확인: standalone build/objdump로 `gdn_decode_kernel<8>` 동일성과 load opcode를 먼저 고정한 뒤 다음 구조 변경을 판단.
+
+## iter #6 (2026-04-24 codex)
+
+- 적용한 최적화: 승인안 A5 standalone. `setup_l2_persistence()`의 `missProp`만 `cudaAccessPropertyNormal -> cudaAccessPropertyStreaming`으로 변경했고, `hitRatio`/`hitProp`, kernel body, dispatch, launch policy는 유지했다.
+- 패킹: 성공.
+- 측정된 latency: full benchmark 1회 `0.016806 ms`, correctness `PASSED=54/54`. 핵심 B=64 workload `eaf0a285`는 `0.026108 ms`였다.
+- full benchmark / 판정: workflow상 Phase 3+는 5회 median 판정이 원칙이지만, 승인 플랜의 veto 조건(`eaf0a285`가 recent accepted band `~0.021~0.024 ms`를 넘으면 즉시 중단)에 걸려 추가 4회 반복은 생략하고 즉시 롤백했다.
+- NCU Duration: 롤백 후 current accepted kernel 기준 `31.46 us`.
+- 남아있는 주요 bottleneck: rollback 후 fallback NCU는 `void gdn_decode_kernel<8>(...)`, `Grid Size=2048`, `Issue Slots Busy=21.73%`, `Memory Throughput=31.57%`, `DRAM Throughput=25.00%`, `L1/TEX Throughput=60.39%`, `L2 Throughput=20.70%`, `Achieved Occupancy=39.79%`, `Registers/thread=56`, local spilling `0`, `L1 hit=7.86%`, `L2 hit=1.76%`였다. 이전 accepted baseline과 마찬가지로 low-issue / reg-limited occupancy / poor-cache-hit 성격이 유지됐다.
+- 이번에 시도했거나 검토했지만 안 좋다고 판단한 방향:
+  - 후보: A5 standalone `missProp=Streaming`.
+  - 안 좋은 이유: host-side L2 policy의 `missProp`만 바꾸는 soft hint는 current kernel의 병목을 건드리지 못했고, 오히려 full benchmark avg가 `0.016806 ms`로 accepted baseline `0.012920 ms`보다 크게 악화됐다. 핵심 B=64 `eaf0a285`도 `0.026108 ms`로 recent accepted band를 명확히 벗어났다.
+  - 재시도 가능 조건: 같은 standalone memory-policy 안은 우선순위를 낮춘다. 다음 메모리 계열은 실제 load opcode 변화가 보이는 A3/A4, 또는 offline codegen/SASS 기준선 확보 후 `q/k` path를 재정의하는 방향일 때만 다시 본다.
+- 다음 iteration 에서 시도할만한 후보 2~3 개:
+  - A3/A4 read-only load path 검증 (`__ldg`, `ld.global.nc.v4.f32`) + SASS 확인: 실제 state/qk load opcode 변화가 보이는 방향만 시도.
+  - benchmark path 밖 codegen 기준선 재확인: standalone build/objdump로 accepted `gdn_decode_kernel<8>`의 `56 regs`, spill `0`, load opcode를 먼저 고정.
+  - offline 기준선 확보 후 `q/k` read-only path 재검토: state가 아니라 `q/k` plain global load 쪽에만 좁혀 leverage를 확인.

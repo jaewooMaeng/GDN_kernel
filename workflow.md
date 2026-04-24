@@ -198,7 +198,7 @@ setmaxnreg.inc.sync.aligned.u32 N / setmaxnreg.dec.sync.aligned.u32 N
   ```
   asm volatile("ld.global.nc.v4.f32 {%0,%1,%2,%3}, [%4];" : "=f"(x),"=f"(y),"=f"(z),"=f"(w) : "l"(ptr));
   ```
-- [ ] **A5. `missProp=Streaming` 실험**: 현재 `missProp=Normal`. state miss 시 L2 오염 방지. Prefetch 리듬이 일정하면 차이 미미하나 B=64+ 대배치에서 state가 L2의 25% 차지 → miss 비중 의미 있을 수 있음.
+- [ ] **A5. `missProp=Streaming` 실험**: 현재 `missProp=Normal`. state miss 시 L2 오염 방지. Prefetch 리듬이 일정하면 차이 미미하나 B=64+ 대배치에서 state가 L2의 25% 차지 → miss 비중 의미 있을 수 있음. **[시도됨 2026-04-24 codex iter #6, 롤백]** `setup_l2_persistence()`의 `missProp`만 `cudaAccessPropertyNormal -> cudaAccessPropertyStreaming`으로 바꾸고 `hitRatio`/`hitProp`, kernel body, dispatch, launch policy는 그대로 뒀지만 full benchmark 1회차 avg가 `0.016806 ms`, B=64 `eaf0a285`가 `0.026108 ms`로 recent accepted band(`~0.021~0.024 ms`)를 명확히 벗어났다. approved veto에 따라 추가 4회 median 측정 없이 즉시 롤백했고, 같은 standalone soft L2 policy 안은 우선순위를 낮춘다. 이후 메모리 계열은 실제 load opcode 변화(A3/A4)나 offline codegen/SASS 기준선 확보 후의 `q/k` path 재정의처럼 더 직접적인 변경만 우선 검토한다.
 - [ ] **A6. Shared memory carveout = 0 (L1 극대화)**: `cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 0)`. 현재 s_v 512B만 사용 → L1 확대로 state L1 hit 증가 유도. **[시도됨 2026-04-24 codex iter #3, 롤백]** host launch 경로에 variant별 1회 `PreferredSharedMemoryCarveout=0`만 추가한 standalone 실험을 했지만, decision-gate B=64 workload `eaf0a285`가 `0.028602 ms`로 recent accepted band(`~0.021~0.024 ms`)보다 명확히 느려 full benchmark/NCU 전에 즉시 롤백했다. carveout 단독안은 재시도하지 않고, 이후에는 load opcode 변경(A3/A4)이나 q/k 중복 제거(B1)처럼 더 직접적인 구조 변화가 있을 때만 다시 본다.
 - [ ] **A7. 반대 실험: carveout = MAX**: 대용량 SMEM으로 state 일부 bring-down 준비 (H 카테고리 도입 시 필수).
 - [ ] **A8. s_v[] broadcast 효율 확인**: 모든 thread가 동일 `s_v[vi_a]` 접근 → hardware broadcast 기대. `cuobjdump` 로 `LDS.U.32.BROADCAST` 또는 `MOVM`의 broadcast 모드 확인. 불완전 시 `__shfl_sync(0xffffffff, reg_val, src_lane)`로 레지스터 broadcast 대체.
@@ -420,6 +420,7 @@ B200 SM ≈ 148:
 | R13 | A6 standalone `PreferredSharedMemoryCarveout=0` | `eaf0a285` decision gate 0.028602 avg | 롤백 |
 | R14 | `ROWS_PER_WARP=4` dead-prefetch 제거 | subset 0.028053 avg / `eaf0a285` gate 0.029683 avg | 롤백 |
 | R15 | `RPW=4` 물리 분리 + dead-prefetch 제거 재시도 | `eaf0a285` decision gate 0.025462 avg | 롤백 |
+| R16 | A5 standalone `missProp=Streaming` | full benchmark 1회 0.016806 avg / `eaf0a285` 0.026108 | 롤백 |
 
 **핵심 인사이트 (Iter 20)**: 32 lanes 동시 exp/log1p → SFU throughput 심각 경쟁. Lane 0 전담 + 3 shuffle로 SFU 경쟁 완전 제거 = Phase 2 break-through.
 
@@ -452,6 +453,8 @@ B200 SM ≈ 148:
 **R14 인사이트**: `gdn_decode_kernel<4>` 전용 dead-prefetch 제거는 코드상으로는 맞는 낭비 제거였지만, helperization 형태로 넣자 representative subset과 B=64 guard가 모두 악화됐다. 즉 small-batch 전용 의도만으로는 충분하지 않고, 다음 `RPW=4` 계열은 `gdn_decode_kernel<8/16>` large-batch path가 실제로 byte-for-byte 동일하거나 SASS가 동일하다는 증거를 먼저 확보한 뒤에만 다시 시도한다.
 
 **R15 인사이트**: `RPW=4`를 별도 커널로 물리 분리해 `gdn_decode_kernel<8/16>` 본문과 launch policy를 그대로 둔 상태에서도 B=64 guard가 `0.025462 ms`로 recent accepted band 상단을 넘었다. 즉 iter #4의 회귀를 helperization/codegen 흔들림만으로 설명하기 어렵고, dead-prefetch 제거 자체의 leverage가 작거나 small-batch 이득이 large-batch veto를 상쇄하지 못한다. 같은 `RPW=4` 계열은 우선순위를 낮추고, 다음에는 kernel body 무변경 A5 또는 실제 state load opcode 변화가 확인되는 A3/A4 쪽을 먼저 본다.
+
+**R16 인사이트**: `setup_l2_persistence()`의 `missProp`만 `Streaming`으로 바꾸는 standalone soft L2 policy 안도 benchmark를 크게 악화시켰다. full benchmark avg가 `0.016806 ms`, 핵심 B=64 `eaf0a285`가 `0.026108 ms`로 recent accepted band를 명확히 넘었고, rollback 후 baseline NCU도 `gdn_decode_kernel<8>`, `Duration=31.46 us`, `Issue Slots Busy=21.73%`, `Achieved Occupancy=39.79%`, `Registers/thread=56`, `L1 hit=7.86%`, `L2 hit=1.76%`로 근본 병목이 그대로였다. host-side cache policy 단독안은 우선순위를 낮추고, 다음 메모리 계열은 실제 load opcode 변화(A3/A4)나 offline codegen/SASS 기준선 확보 후의 `q/k` path 검토처럼 codegen 사실이 보이는 방향으로만 좁힌다.
 
 ### Phase 3+ 기록 템플릿
 
