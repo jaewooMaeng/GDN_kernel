@@ -205,7 +205,7 @@ setmaxnreg.inc.sync.aligned.u32 N / setmaxnreg.dec.sync.aligned.u32 N
 - [ ] **A9. bf16 vectorized load 폭 증가 시도**: 현재 k, q 각각 `uint2` (64-bit) × 1 → 128-bit 못 채움. 가능하면 레이아웃 조정으로 128-bit 통합 고려 (비현실적일 수 있음).
 - [ ] **A10. Cold iter 진단**: Modal iter=50 중 초기 3~5 iter가 유독 느린지 개별 측정. 그렇다면 I1 (warmup kernel) 효과적.
 - [x] **A11. Streaming store (`__stcs`) for new_state** [시도됨 Iter 6, 후퇴]. 재시도 금지.
-- [ ] **A12. `ROWS_PER_WARP=4` dead prefetch 제거**: `gdn_decode_kernel<4>`에서 첫 4-row chunk만 쓰는데도 `next_a..d` 4개 row를 추가로 읽는 낭비를 제거한다. **[시도됨 2026-04-24 codex iter #4, 롤백]** `state_prefetch<4>` 특수화로 `RPW=4` 경로에서 `next_*` 초기 load/rotate를 없앴지만, representative subset 3-workload quick avg가 `0.028053 ms`, B=64 `eaf0a285` decision gate가 `0.029683 ms`로 recent accepted band(`~0.021~0.024 ms`)보다 명확히 느렸다. source-level로는 `RPW=8/16` 수학식을 안 건드렸어도 helperization이 codegen을 흔들었을 가능성을 배제할 수 없으므로, **large-batch path byte-for-byte 동일성이나 SASS 확인이 없는 같은 구현 형태는 보류**한다.
+- [ ] **A12. `ROWS_PER_WARP=4` dead prefetch 제거**: `gdn_decode_kernel<4>`에서 첫 4-row chunk만 쓰는데도 `next_a..d` 4개 row를 추가로 읽는 낭비를 제거한다. **[시도됨 2026-04-24 codex iter #4, 롤백]** `state_prefetch<4>` 특수화로 `RPW=4` 경로에서 `next_*` 초기 load/rotate를 없앴지만, representative subset 3-workload quick avg가 `0.028053 ms`, B=64 `eaf0a285` decision gate가 `0.029683 ms`로 recent accepted band(`~0.021~0.024 ms`)보다 명확히 느렸다. source-level로는 `RPW=8/16` 수학식을 안 건드렸어도 helperization이 codegen을 흔들었을 가능성을 배제할 수 없으므로, **large-batch path byte-for-byte 동일성이나 SASS 확인이 없는 같은 구현 형태는 보류**한다. **[재시도됨 2026-04-24 codex iter #5, 롤백]** 이번에는 `RPW=4`를 별도 커널로 물리 분리하고 case `4` dispatch만 교체해 `gdn_decode_kernel<8/16>` 본문을 보존했지만, B=64 `eaf0a285` decision gate가 `0.025462 ms`로 recent accepted band 상단(`~0.024 ms`)을 다시 넘었다. helperization 리스크를 제거해도 개선 근거가 없었으므로, 같은 방향은 separate translation unit/SASS 동일성 증명이 없으면 우선순위를 낮추고 kernel body 무변경 host-side 안(A5) 또는 실제 load opcode 검증(A3/A4)을 먼저 본다.
 
 ---
 
@@ -419,6 +419,7 @@ B200 SM ≈ 148:
 | R11 | G5-lite wrapper ptxas flags (`-Xptxas -v -warn-spills`) | 0.015814 median | 롤백 |
 | R13 | A6 standalone `PreferredSharedMemoryCarveout=0` | `eaf0a285` decision gate 0.028602 avg | 롤백 |
 | R14 | `ROWS_PER_WARP=4` dead-prefetch 제거 | subset 0.028053 avg / `eaf0a285` gate 0.029683 avg | 롤백 |
+| R15 | `RPW=4` 물리 분리 + dead-prefetch 제거 재시도 | `eaf0a285` decision gate 0.025462 avg | 롤백 |
 
 **핵심 인사이트 (Iter 20)**: 32 lanes 동시 exp/log1p → SFU throughput 심각 경쟁. Lane 0 전담 + 3 shuffle로 SFU 경쟁 완전 제거 = Phase 2 break-through.
 
@@ -449,6 +450,8 @@ B200 SM ≈ 148:
 **R13 인사이트**: A6 standalone `PreferredSharedMemoryCarveout=0`도 B=64 decision gate에서 `0.028602 ms`로 recent accepted band(`~0.021~0.024 ms`)보다 명확히 느려졌다. 현재 커널은 shared usage가 작지만, carveout만으로는 low-issue / low-occupancy / poor-cache-hit 병목을 움직이지 못했고 host-side attribute 설정만으로 benchmark latency가 악화될 수 있음을 확인했다. 이후 메모리 계열은 carveout/L2 힌트 단독안보다 실제 load path(A3/A4) 변경이나 q/k 중복 제거(B1)처럼 더 직접적인 구조 변화에 집중한다.
 
 **R14 인사이트**: `gdn_decode_kernel<4>` 전용 dead-prefetch 제거는 코드상으로는 맞는 낭비 제거였지만, helperization 형태로 넣자 representative subset과 B=64 guard가 모두 악화됐다. 즉 small-batch 전용 의도만으로는 충분하지 않고, 다음 `RPW=4` 계열은 `gdn_decode_kernel<8/16>` large-batch path가 실제로 byte-for-byte 동일하거나 SASS가 동일하다는 증거를 먼저 확보한 뒤에만 다시 시도한다.
+
+**R15 인사이트**: `RPW=4`를 별도 커널로 물리 분리해 `gdn_decode_kernel<8/16>` 본문과 launch policy를 그대로 둔 상태에서도 B=64 guard가 `0.025462 ms`로 recent accepted band 상단을 넘었다. 즉 iter #4의 회귀를 helperization/codegen 흔들림만으로 설명하기 어렵고, dead-prefetch 제거 자체의 leverage가 작거나 small-batch 이득이 large-batch veto를 상쇄하지 못한다. 같은 `RPW=4` 계열은 우선순위를 낮추고, 다음에는 kernel body 무변경 A5 또는 실제 state load opcode 변화가 확인되는 A3/A4 쪽을 먼저 본다.
 
 ### Phase 3+ 기록 템플릿
 

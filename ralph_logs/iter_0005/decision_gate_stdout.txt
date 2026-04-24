@@ -1,0 +1,50 @@
+✓ Initialized. View run at 
+https://modal.com/apps/shjj1504/main/ap-2NYrCSbrclT3WQPQ4eNPpj
+✓ Created objects.
+├── 🔨 Created mount /Users/jaewoo/SAIT/FlashInfer 
+│   Challenge/mlsys26-final-decode/scripts/run_modal.py
+└── 🔨 Created function run_benchmark.
+[2026-04-24T22:39:25] Loading solution from JSON: solution.json
+[2026-04-24T22:39:25] Validating solution JSON...
+[2026-04-24T22:39:25] Loaded solution gdn-decode-v2 (gdn_decode_qk4_v8_d128_k_last) in 0.00s
+[2026-04-24T22:39:25] Decision-gate mode enabled: warmup_runs=1, iterations=5, num_trials=2, use_isolated_runner=False
+[2026-04-24T22:39:25] Dispatching benchmark to Modal B200...
+[2026-04-24T22:39:25] Workload UUID filter enabled: eaf0a285
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 13.0.2
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+[2026-04-24T13:39:39] Remote benchmark start: solution=gdn-decode-v2, definition=gdn_decode_qk4_v8_d128_k_last
+[2026-04-24T13:39:39] BenchmarkConfig(warmup_runs=1, iterations=5, num_trials=2)
+[2026-04-24T13:39:39] Decode path mode=auto
+[2026-04-24T13:39:39] Loading trace set from /data/data/mlsys26-contest
+[2026-04-24T13:39:41] Loaded trace set in 2.23s
+[2026-04-24T13:39:41] Running benchmark across 1 workloads
+[2026-04-24T13:39:47] Benchmark completed in 6.18s
+[2026-04-24T13:39:47] Decode paths observed: unavailable (external target only or no wrapper logging)
+[2026-04-24T13:39:47] Remote benchmark finished in 8.42s
+[2026-04-24T22:39:47] Received benchmark results in 22.62s
+
+gdn_decode_qk4_v8_d128_k_last:
+  workloads: 1
+  status counts: PASSED=1
+  avg latency: 25.462 µs (0.025462 ms)
+  avg speedup: 1747.01x
+  worst abs error: 1.91e-06
+  worst rel error: 3.11e-02
+  Workload eaf0a285...: PASSED | 25.462 µs (0.025462 ms) | 1747.01x speedup | abs_err=1.91e-06, rel_err=3.11e-02
+[2026-04-24T22:39:47] Local entrypoint finished in 22.62s
+Stopping app - local entrypoint completed.
+✓ App completed. View run at 
+https://modal.com/apps/shjj1504/main/ap-2NYrCSbrclT3WQPQ4eNPpj

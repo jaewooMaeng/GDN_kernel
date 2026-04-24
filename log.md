@@ -516,3 +516,19 @@ Key NCU fields to compare:
   - A3/A4 read-only state load path 검증 (`__ldg`, `ld.global.nc.v4.f32`) + SASS 확인: helperization보다 load opcode 변화가 실제로 보이는 방향.
   - A5 standalone `missProp=Streaming`: kernel body 무변경 host-side 실험으로 좁게 확인.
   - small-batch 전용 분리 검증: `RPW=4` 계열을 다시 볼 거면 large-batch codegen 무변경을 먼저 증명할 수 있는 빌드/objdump 경로를 준비할 것.
+
+## iter #5 (2026-04-24 codex)
+
+- 적용한 최적화: 승인안 A12 재시도. `ROWS_PER_WARP=4` path만 별도 `gdn_decode_kernel_rpw4`로 물리 분리하고, `case 4` dispatch만 새 커널로 연결해 `gdn_decode_kernel<8/16>` 본문과 launch policy는 그대로 두었다. 전용 커널에서는 dead prefetch였던 `next_a..d` 8-row lookahead를 제거했다.
+- 패킹: 성공.
+- 측정된 latency: approved PM gate에 따라 먼저 B=64 `eaf0a285` decision gate만 실행했다. 결과는 `PASSED`, `avg latency = 0.025462 ms`였다.
+- full benchmark / NCU: recent accepted band(`~0.021~0.024 ms`) 상단을 넘는 veto 결과라 full benchmark 5회 median과 NCU profiling은 진행하지 않았다.
+- 판정: helperization 대신 physical split으로 `gdn_decode_kernel<8/16>`를 보존해도 B64 guard가 여전히 후퇴했다. 이번 변경은 채택하지 않고 `solution/cuda/kernel.cu`를 백업본 기준으로 즉시 롤백했다. `ralph_state/latest_latency.txt`는 gate 수치 `0.025462`로 갱신했고, 새 NCU가 없어 `ralph_state/latest_ncu_duration_us.txt`는 유지했다.
+- 이번에 시도했거나 검토했지만 안 좋다고 판단한 방향:
+  - 후보: `RPW=4` 물리 분리 + dead prefetch 제거.
+  - 안 좋은 이유: iter #4의 회귀 원인을 helperization/codegen 흔들림으로 좁혀 재시도했지만, large-batch 본문을 보존한 상태에서도 핵심 B64 guard가 `0.025462 ms`로 recent accepted band 상단을 넘었다. dead-prefetch 제거 자체의 leverage가 작거나, small-batch 이득이 full-suite/B64 guard를 상쇄하지 못하는 것으로 보는 편이 타당하다.
+  - 재시도 가능 조건: same idea는 당분간 우선순위를 낮춘다. 다시 보더라도 separate translation unit이나 SASS diff로 `gdn_decode_kernel<8/16>` 동일성을 먼저 증명할 수 있을 때만 검토한다.
+- 다음 iteration 에서 시도할만한 후보 2~3 개:
+  - A5 standalone `missProp=Streaming`: kernel body 무변경 host-side 실험으로 좁고 저위험하게 확인.
+  - A3/A4 read-only state load path 검증 (`__ldg`, `ld.global.nc.v4.f32`) + SASS 확인: 실제 state load opcode 변화가 보이는 방향만 시도.
+  - benchmark path 밖 codegen 기준선 재확인: standalone build/objdump로 `gdn_decode_kernel<8>` 동일성과 load opcode를 먼저 고정한 뒤 다음 구조 변경을 판단.
