@@ -457,3 +457,18 @@ Key NCU fields to compare:
   - G5 기준선 확보: Modal compile 로그에서 `-Xptxas -v -warn-spills`를 실제로 확보해 register/spill/SASS mix를 고정하고, 다음 변화가 정말 `56 regs`를 깎는지 먼저 본다.
   - A3/A4 read-only state load path 검증 (`__ldg`, `ld.global.nc.v4.f32`): 단, load opcode가 실제로 바뀌는지 확인 가능한 경로에서만 시도한다.
   - B2/H2 계열의 block-wide async pipeline: per-thread async copy(R5)와 달리 block/warp 단위 `cuda::pipeline` 또는 `cp.async`로 bytes-in-flight를 키우는 방향만 남겨둔다.
+
+## iter #1 (2026-04-24 codex)
+
+- 적용한 최적화: 승인안 `G5-lite` 단독. `solution/cuda/decode_submit_entry.py`의 `tvm_ffi.cpp.load(...)`에 append-only `-Xptxas -v -Xptxas -warn-spills`를 추가해 benchmark runtime path에서 compile/codegen 기준선을 재고정하려 했다. kernel body와 dispatch, memory policy는 건드리지 않았다.
+- 측정된 latency: exploratory 병렬 4회는 `[0.011682, 0.015693, 0.015363, 0.016939] ms`로 self-contention이 섞인 bimodal 분포를 보여 판정에서 제외했다. 판정용 순차 5회는 `[0.011985, 0.016380, 0.011427, 0.016363, 0.015814] ms`, median `0.015814 ms`, correctness `PASSED=54/54`였다. accepted baseline `0.012920 ms` median 대비 명확한 회귀라 wrapper flag 주입은 전체 롤백했다.
+- NCU Duration: rollback 후 현재 accepted kernel 기준 `31.97 us`.
+- 남아있는 주요 bottleneck: rollback 후 profiled kernel은 fallback NCU에서 `void gdn_decode_kernel<8>(...)`, `Grid Size=2048`, `Block Size=128`, `Issue Slots Busy=21.98%`, `Memory Throughput=31.91%`, `DRAM Throughput=24.78%`, `L1/TEX Throughput=59.74%`, `L2 Throughput=20.40%`, `Achieved Occupancy=40.11%`, `Registers/thread=56`, local spilling `0`, `L1 hit=7.85%`, `L2 hit=1.77%`였다. 즉, 현재 accepted large-batch path는 문서 일부와 달리 `batch_size >= 32 -> split_factor = 4 -> gdn_decode_kernel<8>` 상태이며, low-issue / reg-limited occupancy / tail effect가 여전히 핵심이다.
+- 이번에 시도했거나 검토했지만 안 좋다고 판단한 방향:
+  - 후보: benchmark runtime path에서의 G5-lite wrapper flag 주입.
+  - 안 좋은 이유: compile-only 기준선 재고정 의도와 달리, same command 5회 순차 median이 `0.015814 ms`로 크게 후퇴했다. `tvm_ffi` build path는 successful ptxas stdout를 surface하지 않아 실제 register/spill/codegen 사실도 benchmark 로그만으로는 충분히 못 고정했다.
+  - 재시도 가능 조건: 동일한 ptxas/SASS 재고정은 benchmark path 안에서 다시 하지 않는다. 이후에는 standalone build dir, `build.ninja`, `cuobjdump` 같은 비측정 경로에서만 codegen 사실을 확보하고, benchmark path에는 duration을 직접 줄이는 변경만 태운다.
+- 다음 iteration 에서 시도할만한 후보 2~3 개:
+  - B2/H2 block-wide async pipeline: current `gdn_decode_kernel<8>` large-batch path의 low-issue / bytes-in-flight 부족을 직접 건드리는 방향.
+  - A5 standalone (`missProp=Streaming`): kernel body 무변경으로 memory policy만 조정하는 저위험 host-side 후보.
+  - codegen 기준선 재고정의 분리 실행: wrapper flag를 benchmark path에 넣지 말고 standalone build/objdump 경로로 옮겨 `56 regs`, spill `0`, 실제 load opcode를 먼저 고정할 것.

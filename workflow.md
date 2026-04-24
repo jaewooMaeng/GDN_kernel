@@ -292,7 +292,7 @@ setmaxnreg.inc.sync.aligned.u32 N / setmaxnreg.dec.sync.aligned.u32 N
 - [x] **G2. `__restrict__`** [적용됨].
 - [x] **G3. `__launch_bounds__(128, 9)`** [적용됨 Iter 17].
 - [ ] **G4. `-arch=sm_100a` 명시 확인**: TMA bulk tensor, tcgen05, `__reduce_add_sync` (redux.sync), cluster 등 Blackwell 전용 활성화. 현재 `sm_100` 추정. `nvcc --verbose`로 실제 gencode 확인. `sm_100f` (family-specific) 대안.
-- [ ] **G5. `-Xptxas -v -Xptxas -warn-spills` 로 register/spill 분석**: Iter 18 (128, 10) 실패 원인. 현재 (128, 9) 하에서 정확한 register/spill 수치 확인 후 G7 조합 기준선.
+- [ ] **G5. `-Xptxas -v -Xptxas -warn-spills` 로 register/spill 분석**: Iter 18 (128, 10) 실패 원인. 현재 (128, 9) 하에서 정확한 register/spill 수치 확인 후 G7 조합 기준선. **[시도됨 2026-04-24 codex iter #1, 롤백]** `decode_submit_entry.py` wrapper에 append-only ptxas flags를 넣고 benchmark 경로에서 5회 순차 측정을 다시 돌렸지만 `[0.011985, 0.016380, 0.011427, 0.016363, 0.015814] ms`, median `0.015814 ms`로 accepted baseline `0.012920 ms`보다 크게 악화됐다. `tvm_ffi` build path는 successful ptxas stdout를 surface하지 않아 codegen 기준선 고정 이득도 제한적이었으므로, **benchmark runtime path에서의 G5 flag 주입은 재시도하지 않고 이후에는 standalone build/objdump 같은 비측정 경로에서만 재확인**한다.
 - [ ] **G6. `__builtin_assume()` 힌트**: 
   ```
   __builtin_assume(blockDim.x == BLOCK_SIZE);
@@ -352,7 +352,7 @@ Kernel: gdn_decode_kernel<ROWS_PER_WARP>
   Gate:      lane 0만 softplus/exp 계산 후 3회 shfl broadcast (Iter 20)
   L2:        host-side persistence with hitRatio 공식 (setup_l2_persistence)
 
-Split factor: B≤2:8 (RPW=4), B<32:4 (RPW=8), B≥32:2 (RPW=16)
+Split factor: B<32:8 (RPW=4), B≥32:4 (RPW=8)
 State: [B, 8, 128, 128] fp32 k-last
 I/O:   bf16 입력(q/k/v/a/b_gate), fp32 state/A_log/dt_bias, bf16 출력
 ```
@@ -366,9 +366,10 @@ SMEM:       512 B (s_v[128] × 4B) — 비병목
 B200 SM ≈ 148:
   B=1,  split=8: grid=64   → 43% util (tail)
   B=2,  split=8: grid=128  → 86%
-  B=4,  split=4: grid=128  → 86%
-  B=16, split=4: grid=512  → balanced
-  B=32, split=2: grid=512  → balanced
+  B=4,  split=8: grid=256  → 1 partial wave
+  B=16, split=8: grid=1024 → balanced
+  B=32, split=4: grid=1024 → balanced
+  B=64, split=4: grid=2048 → NCU상 1.54 waves/SM
 ```
 
 ### 현재 병목 (Phase 3/4 관점)
@@ -414,6 +415,7 @@ B200 SM ≈ 148:
 | R8 | `B>=32` compile-time 2-CTA cluster q/k 공유 | 0.018499 avg | 롤백 |
 | R9 | `warp0` q/k shared stage + CTA scalar dedup (all paths) | 0.012932 avg / rollback baseline 0.012671 avg | 롤백 |
 | R10 | `float4` q/k + `__fmaf_rn` + existing-barrier block scalar dedup | 0.013102 median | 롤백 |
+| R11 | G5-lite wrapper ptxas flags (`-Xptxas -v -warn-spills`) | 0.015814 median | 롤백 |
 
 **핵심 인사이트 (Iter 20)**: 32 lanes 동시 exp/log1p → SFU throughput 심각 경쟁. Lane 0 전담 + 3 shuffle로 SFU 경쟁 완전 제거 = Phase 2 break-through.
 
@@ -436,6 +438,8 @@ B200 SM ≈ 148:
 **R9 인사이트**: E1 계열을 더 좁혀 `warp0`만 q/k와 block-invariant scalar를 준비하고 기존 `s_v` barrier로 CTA 전체에 배포하는 변형까지 시도했지만, same-day baseline full benchmark를 넘지 못했다. full avg는 `0.012932 ms`였고 rollback 후 accepted baseline은 `0.012671 ms`였다. extra barrier를 제거해도 shared q/k fan-out cost가 남았고, standalone CTA-local q/k dedup만으로는 current kernel의 low-issue / small-grid 병목을 충분히 움직이지 못했다.
 
 **R10 인사이트**: `q/k float4 + __fmaf_rn` helper와 기존 `__syncthreads()`를 재활용한 block-scalar dedup(`g/beta/beta_g/qk_dot`)을 묶어도 benchmark는 개선되지 않았다. 5회 avg가 `[0.012688, 0.013137, 0.013102, 0.012761, 0.018742] ms`였고 median은 `0.013102 ms`로 accepted baseline `0.012920 ms`보다 악화됐다. B=64 `eaf0a285`도 대부분 `0.024~0.025 ms`에 머물렀고 5회차는 `0.028653 ms`까지 튀었다. source-level FFMA/live-range cleanup만으로는 current low-issue / reg-limited occupancy 병목을 못 움직였으므로, 다음에는 실제 register 감소 근거가 있는 SASS/ptxas 기준선 확보나 특정 batch-path 격리 없이는 같은 계열을 재시도하지 않는다.
+
+**R11 인사이트**: append-only `-Xptxas -v -warn-spills` 자체는 “compile/codegen 기준선 재고정” 의도였지만, benchmark runtime path에 wrapper flag를 직접 얹는 방식은 5회 순차 median이 `0.015814 ms`로 크게 후퇴해 채택할 수 없었다. 동시에 rollback 후 NCU는 현재 accepted large-batch 경로가 `gdn_decode_kernel<8>`, `Grid Size=2048`, `Duration=31.97 us`, `Issue Slots Busy=21.98%`, `Achieved Occupancy=40.11%`, `Registers/thread=56`, spill `0`임을 다시 보여 줬다. 다음 기준선 고정 작업은 benchmark path 밖의 standalone build/objdump로 옮기고, 실제 kernel-side 후보는 B2/H2 block-wide async pipeline이나 A5 `missProp=Streaming`처럼 Duration을 직접 건드리는 안으로 좁히는 편이 낫다.
 
 ### Phase 3+ 기록 템플릿
 
