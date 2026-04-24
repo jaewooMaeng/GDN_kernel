@@ -30,6 +30,15 @@ __device__ __forceinline__ float softplus(float x) {
     return log1pf(expf(x));
 }
 
+// A4: Inline PTX for read-only global load with bypass
+__device__ __forceinline__ float4 ld_global_nc_f4(const float4* ptr) {
+    float4 result;
+    asm volatile("ld.global.nc.v4.f32 {%0,%1,%2,%3}, [%4];"
+        : "=f"(result.x), "=f"(result.y), "=f"(result.z), "=f"(result.w)
+        : "l"(ptr));
+    return result;
+}
+
 template<int ROWS_PER_WARP>
 __global__ void __launch_bounds__(BLOCK_SIZE, 9) gdn_decode_kernel(
     const bf16* __restrict__ q,
@@ -117,26 +126,40 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 9) gdn_decode_kernel(
     const int vi_start = split_id * ROWS_PER_BLOCK + warp_id * ROWS_PER_WARP;
     const int lane4 = lane << 2;
 
-    // B2: Enhanced prefetch with single-step lookahead (original pattern with larger prefetch)
-    float4 pf_a = __ldg(reinterpret_cast<const float4*>(state_base + vi_start * HEAD_DIM + lane4));
-    float4 pf_b = __ldg(reinterpret_cast<const float4*>(state_base + (vi_start + 1) * HEAD_DIM + lane4));
-    float4 pf_c = __ldg(reinterpret_cast<const float4*>(state_base + (vi_start + 2) * HEAD_DIM + lane4));
-    float4 pf_d = __ldg(reinterpret_cast<const float4*>(state_base + (vi_start + 3) * HEAD_DIM + lane4));
+    // H2.5: Dual-buffer prefetch for 8-row lookahead
+    // curr_*: rows [vi_off, vi_off+4)
+    // next_*: rows [vi_off+4, vi_off+8)
+    float4 curr_a = ld_global_nc_f4(reinterpret_cast<const float4*>(state_base + vi_start * HEAD_DIM + lane4));
+    float4 curr_b = ld_global_nc_f4(reinterpret_cast<const float4*>(state_base + (vi_start + 1) * HEAD_DIM + lane4));
+    float4 curr_c = ld_global_nc_f4(reinterpret_cast<const float4*>(state_base + (vi_start + 2) * HEAD_DIM + lane4));
+    float4 curr_d = ld_global_nc_f4(reinterpret_cast<const float4*>(state_base + (vi_start + 3) * HEAD_DIM + lane4));
+
+    float4 next_a = ld_global_nc_f4(reinterpret_cast<const float4*>(state_base + (vi_start + 4) * HEAD_DIM + lane4));
+    float4 next_b = ld_global_nc_f4(reinterpret_cast<const float4*>(state_base + (vi_start + 5) * HEAD_DIM + lane4));
+    float4 next_c = ld_global_nc_f4(reinterpret_cast<const float4*>(state_base + (vi_start + 6) * HEAD_DIM + lane4));
+    float4 next_d = ld_global_nc_f4(reinterpret_cast<const float4*>(state_base + (vi_start + 7) * HEAD_DIM + lane4));
 
     #pragma unroll
     for (int vi_off = 0; vi_off < ROWS_PER_WARP; vi_off += 4) {
         const int vi_a = vi_start + vi_off;
 
-        float4 st4_a = pf_a;
-        float4 st4_b = pf_b;
-        float4 st4_c = pf_c;
-        float4 st4_d = pf_d;
+        float4 st4_a = curr_a;
+        float4 st4_b = curr_b;
+        float4 st4_c = curr_c;
+        float4 st4_d = curr_d;
 
-        if (vi_off + 4 < ROWS_PER_WARP) {
-            pf_a = __ldg(reinterpret_cast<const float4*>(state_base + (vi_a + 4) * HEAD_DIM + lane4));
-            pf_b = __ldg(reinterpret_cast<const float4*>(state_base + (vi_a + 5) * HEAD_DIM + lane4));
-            pf_c = __ldg(reinterpret_cast<const float4*>(state_base + (vi_a + 6) * HEAD_DIM + lane4));
-            pf_d = __ldg(reinterpret_cast<const float4*>(state_base + (vi_a + 7) * HEAD_DIM + lane4));
+        // Rotate buffers for next iteration
+        curr_a = next_a;
+        curr_b = next_b;
+        curr_c = next_c;
+        curr_d = next_d;
+
+        // Prefetch 8 rows ahead
+        if (vi_off + 8 < ROWS_PER_WARP) {
+            next_a = ld_global_nc_f4(reinterpret_cast<const float4*>(state_base + (vi_a + 8) * HEAD_DIM + lane4));
+            next_b = ld_global_nc_f4(reinterpret_cast<const float4*>(state_base + (vi_a + 9) * HEAD_DIM + lane4));
+            next_c = ld_global_nc_f4(reinterpret_cast<const float4*>(state_base + (vi_a + 10) * HEAD_DIM + lane4));
+            next_d = ld_global_nc_f4(reinterpret_cast<const float4*>(state_base + (vi_a + 11) * HEAD_DIM + lane4));
         }
 
         float ks_a = k_vals[0]*st4_a.x + k_vals[1]*st4_a.y + k_vals[2]*st4_a.z + k_vals[3]*st4_a.w;
@@ -241,8 +264,8 @@ void gdn_decode(
 
     int split_factor;
     if (batch_size <= 2) split_factor = 8;
-    else if (batch_size < 32) split_factor = 4;
-    else split_factor = 2;
+    else if (batch_size < 32) split_factor = 8;
+    else split_factor = 4;
     int rows_per_warp = HEAD_DIM / split_factor / NUM_WARPS;
 
     DLDevice dev = q.device();

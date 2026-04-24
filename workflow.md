@@ -485,3 +485,10 @@ B200 SM ≈ 148:
 - **Phase 4 돌파 추천 순서**: B1 변형 (단, R8의 minimal q/k-share-only 안 제외) → B2/H2 (async pipeline) → B5 (warp specialization) → D5 (단, graph를 wrapper 바깥 반복 루프에서 재사용할 수 있을 때만). 현재 harness 경로에선 D5가 bad direction이었다.
 - **10회 이상 답보**: `ncu --set full` + `cuobjdump --dump-sass` 로 병목 재확인 (`smsp__inst_executed_pipe_*`, `smsp__warp_issue_stalled_*`, SASS 내 FFMA/LDG/SHFL 비율). 사용자에게 결과 공유.
 - `modal run` 컴파일 에러 즉시 해결. `-Xptxas -v` 출력은 매 변경 후 확인 (register/spill 추적).
+
+---
+
+## 13. 실패 메모 (iter #1 claude 2026-04-24)
+
+- **F4 (output store 4-way lane 분산)**: ❌ +43.1% 회귀 (0.011108 → 0.015891 ms, 54/54 PASS). 현 inner loop 에 `qs_*` broadcast 4개 shfl 추가 + lane select 체인이 register pressure / issue slot 을 잠식. 다음 iter 재시도 금지. shfl_xor reduce 재구성 없이는 현 구조에서 4-way store 이득 없음.
+- 다음 iter 우선순위: A6 (SMEM carveout=0 standalone) → G6 (__builtin_assume) → F3 (in-place state API 조사).

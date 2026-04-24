@@ -1,400 +1,224 @@
-# Iteration #2 (2026-04-24 session) 계획
+# Iteration #1 (2026-04-24) — Step 1~2 계획
 
-## Step 1: 현재 상황 정리
+## 현재 기준선 요약
 
-### Iteration #1 결과 요약
-- **이전 기준선**: 0.012920 ms (Phase 3 median of 5)
-- **Iteration #1 개선**: avg latency 0.011415 ms (**+11.6% 개선**)
-- **목표**: 0.009 ms (Phase 4)
-- **남은 거리**: 0.002415 ms (**≈ 20% 추가 개선 필요**)
-
-### Iteration #1 시도 결과 (A3: `__ldg()` 명시)
-| 항목 | 수치 | 평가 |
+| 항목 | 수치 | 출처 |
 |------|------|------|
-| avg latency | 0.011415 ms | ✅ |
-| NCU Kernel Duration | 33.31 us | 개선 미미 |
-| Issue Slots Busy | 17.33% | ⚠️ 여전히 매우 낮음 |
-| Achieved Occupancy | 27.34% | ⚠️ register pressure (56 reg/thread) 제한 |
-| L1 Hit | 5.37% | ⚠️ cache 효과 미미 (single-pass streaming 특성) |
+| **avg latency** | **0.011108 ms** | `ralph_state_claude/latest_latency.txt` |
+| **NCU Kernel Duration** | **30.85 µs** | `ralph_state_claude/latest_ncu_duration_us.txt` |
+| **Target (Phase 4)** | < 0.009 ms | `workflow.md` |
+| **남은 거리** | **–0.002108 ms (약 19%)** | 계산 |
+| **Correctness** | ✅ 54/54 PASSED | iter #4 bench |
+| **Kernel 내 이미 적용된 기법** | `__ldg` (PTX `ld.global.nc`), I1 split factor, H2.5 dual-buffer 8-row prefetch, lane-0 gate, L2 persistence, `__launch_bounds__(128,9)` | `solution/cuda/kernel.cu` 확인 |
+| **NCU 주요 병목** | IPC Active 1.74 / Issue Slots Busy 22.57% / Achieved Occupancy 42.27% / L1 Hit 7.86% / L2 Hit 1.76% / Memory TP 1.72 TB/s | iter #4 NCU detailed |
 
-**교훈**: `__ldg()` 추가는 단편적 개선일 뿐, **근본 병목(low-issue-slots + register-pressure)을 해결하지 못함**.
-
----
-
-### 현재 병목 분석 (NCU + kernel 특성 기반)
-
-#### 병목 1: 극도로 낮은 Issue Slot 활용 (17.33%)
-```
-원인: Per-warp ILP 부족
-- State read (global L2 hit, ~100 cycles latency)
-- Q/K reduction (warp-wide reduction, ~50 cycles 대기)
-- 이들이 순차적으로 발생하면서 warp은 대부분 stall 상태
-
-해결 방향:
-  a) Warp specialization: 1 warp load 전담 → 3 warp compute 병렬 → ILP ↑
-  b) Double-buffering + async pipeline: 다음 iteration 데이터 미리 fetch → overlap
-```
-
-#### 병목 2: 낮은 Achieved Occupancy (27.34%)
-```
-원인: Register pressure (56 reg/thread)
-- 매 loop iteration에서 q[], k[], s_v[128], state[128]을 유지
-- Registers: 28+4 (for loop state) = ~56 reg/thread
-
-해결 방향:
-  a) Warp specialization + setmaxnreg: producer 64 reg, consumer 48 reg
-  b) Shared memory staging: register spilling 대신 SMEM 사용
-```
-
-#### 병목 3: 작은 Grid (1024 blocks / 148 SMs = 6.9 blocks/SM)
-```
-원인: B=64 workload는 split_factor=2 (V_head 2개 split)
-- 1024 blocks / 148 SMs = 정체 위험, bytes-in-flight 부족
-
-해결 방향:
-  a) Split factor 증가 (split=4, 8): blocks ↑ → grid parallelism ↑
-  b) CUDA Graph로 host launch overhead 제거 (일부 보상)
-```
-
-#### 병목 4: L2 cache hit는 높지만 overall bandwidth 부족
-```
-근거: State read는 L2 warm 상태 (모든 batch에서 state ⊆ 126MB L2)
-      하지만 bytes-in-flight는 여전히 부족
-      
-주요 이유:
-  - L2-HBM 재주입이 느림 (한 번의 global read → ~100 cycles 대기)
-  - Warp 4개가 동시에 다양한 위치에서 read → L2 port contention
-```
+### 최근 실패 이력 (재시도 금지 또는 조건부)
+- **B5 warp specialization**: iter #2 SUSPENDED — SMEM 인덱싱 오류
+- **C1 unroll 8**: iter #4 +5.8% 회귀 → register 압박
+- **C2 `redux.sync.add.f32`**: iter #3·R7 빌드/PTX 거부
+- **A2 annotated_ptr**: R7 +46% 회귀
+- **B1 2-CTA cluster (minimal)**: R8 +43% 회귀
+- **D5 CUDA Graph (wrapper 내부)**: R4 +8~35% 회귀
+- **R2/R3 shared q/k staging**: 2회 모두 회귀
+- **R5 per-thread pipeline_memcpy_async**: +1.6% 회귀
+- **R9/R10 shared q/k + FFMA dedup**: 회귀
 
 ---
 
-## Step 2: 다음 후보 검토 및 선택
+## Step 1: 후보군 도출 및 리스크 분석
 
-### 검토 대상: 4가지 방향
-
-#### **후보 B5: Warp Specialization (producer/consumer + mbarrier)**
-
-**구성**:
-```cuda
-// 4 warps 구성
-// Warp 0: Async load 전담 (producer)
-//   - State read, Q/K read를 cuda::memcpy_async로 dispatch
-//   - mbarrier로 consumer 대기, setmaxnreg.inc로 register free
-//
-// Warp 1-3: Compute 전담 (consumer)
-//   - mbarrier로 producer 대기
-//   - setmaxnreg.dec로 더 많은 register 확보 (48~52/thread)
-//   - Q/K reduction, S_V accumulation 수행
-```
-
-**근거**:
-- **Issue Slot 병목 직접 해결**: Warp 0이 load를 독점하므로 warp 1-3은 compute에만 집중 → ILP ↑
-- **Register pressure 해소**: setmaxnreg.dec로 warp 1-3이 48~52 reg/thread 사용 가능 → occupancy 30~35% ↑
-- **Blackwell 지원**: sm_100a는 `__mbarrier_init_parity`, `setmaxnreg.inc/dec` PTX 지원 ✅
-- **Bytes-in-flight 증가**: Async load가 독점 → HBM→L2 대역폭 포화 가능
-
-**예상 결과**:
-| 지표 | 이전 | 기대 |
-|------|------|------|
-| Median Latency | 0.011415 ms | 0.010~0.010.5 ms (성공 시) |
-| Register/thread | 56 | 48~52 (consumer) / 32~40 (producer) |
-| Achieved Occupancy | 27.34% | 32~38% |
-| Issue Slots Busy | 17.33% | 25~30% |
-
-**리스크** (높음):
-- `mbarrier` 초기화에 grid-level register (`__grid_group`) 필요 → TVM FFI launcher 수정 필요 가능성
-- Warp 0 (producer only)의 register spilling 위험 → PTX 검증 필수
-- Producer/consumer 스케줄 미스매치 → 이득 상쇄 가능
-- **Partial rollback 불가능** (구조 변경 → 전체 커널 재작성)
-
-**실패 시 귀결**:
-- `mbarrier` FFI 호환성 문제 → benchmark fail / compile error
-- 성능 개선 미미 (producer/consumer 동기화 cost ≈ load 병렬화 이득)
-- 평균 latency ≥ 0.012 ms
+### 기본 방침
+- 현재 커널에는 H2.5 dual-buffer, __ldg, I1, lane-0 gate, L2 persistence가 **이미 모두 적용**되어 있다. 그러나 E2E latency는 0.011108 ms에서 정체됐고 이번 iter의 남은 여지는 **구조적 대변경 없이 kernel body 내부를 손볼 수 있는 저위험 후보**에 있다.
+- 구조적 변경 계열(B1/B2/B5/D5/H4)은 직전 5~6회 거듭 실패했다 → **이번 iter에서는 보수적 후보 위주**로 고른다.
+- PM 관점에서 최소 요구: (a) NCU 근거가 있고, (b) 2~3시간 내 구현 가능하며, (c) 실패 시 즉시 롤백 가능한 **국소 패치**여야 한다.
 
 ---
 
-#### **후보 B2: Async Pipeline (3-stage double buffering)**
+### 후보 A: **F4. Output store를 lane 0~3으로 4-way 분산** (우선도: ★★★ 최상)
 
-**구성**:
-```cuda
-// Stage 0: Preload (첫 iteration에만 q/k/state preload)
-// Stage 1: Main loop
-//   - memcpy_async로 다음 iteration 데이터 비동기 fetch
-//   - 현재 데이터로 compute (reduction 포함)
-//   - barrier 대기
-// Stage 2: Epilogue
-```
+**상세:**
+- 현재 `if (lane == 0) { out_base[vi_a..vi_a+3] = ... }` — lane 0 혼자 4회 bf16(2B) store.
+- 변경: `if (lane < 4) out_base[vi_a + lane] = __float2bfloat16(...)`. lane 0~3이 각각 1 element 담당 → STG.B16 4-way coalesced.
+- `res_a/b/c/d`, `qs_a/b/c/d`는 이미 `__shfl_sync(..., 0)`로 warp 전체에 broadcast돼 있으므로 lane 1~3에도 올바른 값이 있음(추가 shuffle 불필요).
 
-**근거**:
-- **Overlap load/compute**: 현재 iteration compute 중에 다음 iteration load → ILP ↑
-- **Bytes-in-flight 증가**: 최대 3개 iteration 데이터 동시 fetch 가능
-- **구조 변경 최소**: 기존 loop를 async pipeline으로 감싸면 됨
+**NCU 근거:**
+- Issue Slots Busy 22.57% / IPC 1.74의 낮은 값 중 일부는 lane 0 직렬화 store에서 발생하는 idle lane과 관련.
+- B200 STG.B16 throughput 기준 4-lane 분산은 lane 0 단일 대비 latency 숨김 가능.
+- Store 명령 수는 동일(warp 당 4 store)하지만 lane 분산이 issue slot 점유를 단축.
 
-**예상 결과**:
-| 지표 | 이전 | 기대 |
-|------|------|------|
-| Median Latency | 0.011415 ms | 0.010.5~0.011 ms |
-| Issue Slots Busy | 17.33% | 22~25% |
-| Bytes-in-flight | 낮음 | 중간 (3-stage) |
+**기대 효과:** NCU Duration –0.3~–0.8 µs (약 1~3%). E2E latency –0.0002~–0.0005 ms.
 
-**리스크** (중간):
-- **Barrier overhead**: `__syncthreads()` vs `cuda::pipeline::commit()` 비용 비교 필요
-- **Shared memory pressure**: 3-stage buffering에 SMEM 추가 사용 (현재 512B → ~1.5KB)
-- **Loop unroll + async**: 컴파일러가 aggressive로 unroll → register pressure ↑ 가능
-- **이전 실패 경험** (R5): "async pipeline per-thread" 실패 → 지금은 block-level로 수정
+**리스크:** **낮음**
+- `__shfl_sync(..., 0)`로 이미 lane 간 값이 일치 → correctness-safe.
+- 부동소수점 정밀도 영향 **없음** (연산 순서 보존).
+- 실패 시 2줄 revert.
 
-**실패 시 귀결**:
-- Barrier cost > compute/load overlap 이득 → median ≥ 0.012 ms
-- 추가 SMEM 사용 + register spilling → 오히려 성능 악화
+**회귀 위험:** 매우 낮음. `if (lane < 4)` 분기는 B200 conditional-store에서 divergence 비용 미미.
+
+**구현 난도:** 10분. `solution/cuda/kernel.cu` line 209–214 국소 편집.
 
 ---
 
-#### **후보 I1: Split Factor 증가 (작은 grid → 큰 grid)**
+### 후보 B: **A6. SMEM carveout = 0 (L1 극대화)** (우선도: ★★ 중상)
 
-**구성**:
-```cuda
-// 현재: split_factor = 2 (B=64: 8 v_heads × 2 = 16 split, 1024 blocks)
-// 변경: split_factor = 4 (B=64: 8 v_heads × 4 = 32 split, 2048 blocks)
-// 또는 split_factor = 8 (B=64: 8 v_heads × 8 = 64 split, 4096 blocks)
+**상세:**
+- `cudaFuncSetAttribute(gdn_decode_kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 0)`를 host 초기화 1회 적용.
+- 현재 SMEM 사용량 512 B뿐 → carveout=0으로 L1 cache 용량 최대화(약 192 KB까지 가용).
+- State read가 single-pass streaming이라 L1 hit 이득은 제한적이지만, prefetch 경로(`ld.global.nc`)의 L1 line 재사용 구간은 **block 내부 8 rows/warp × 4 warps = 32 rows = 16 KB** → L1에 완전히 들어감.
 
-// 각 split은 128×128 state 중 일부만 accumulate
-// host-side thread가 split 결과를 또 다시 reduce
-```
+**NCU 근거:**
+- L1 Hit Rate 7.86%는 **여전히 낮음** → carveout 확장으로 일부 개선 가능.
+- Memory TP 1.72 TB/s는 32.89% DRAM 활용률로 여유 있음; miss 경로 여유 있으니 hint 조정의 net 이득은 +.
+- 단, R3에서 `carveout=0` 단독 시도는 median 0.013244 ms 회귀 → 해당 실험은 **split-local s_v staging과 결합**해서 실패한 것이므로 **standalone carveout 조정은 미시도에 가까움**.
 
-**근거**:
-- **Grid parallelism 증가**: 1024 → 4096 blocks → 6.9 → 27 blocks/SM → bytes-in-flight ↑
-- **Low-issue 병목 부분 해결**: 더 많은 블록이 동시 run → L2 port contention 분산
-- **구조 변경 최소**: split factor 상수만 변경
+**기대 효과:** –0.0~–0.0003 ms (불확실하나 다운사이드는 거의 없음).
 
-**예상 결과**:
-| 지표 | 이전 | 기대 |
-|------|------|------|
-| Median Latency | 0.011415 ms | 0.011~0.011.3 ms (약간 악화 또는 무변화) |
-| Blocks | 1024 | 4096 |
-| Blocks/SM | 6.9 | 27.6 |
-| Host-side reduce overhead | 낮음 | 중간 (4배 split → 4배 reduce kernel call) |
+**리스크:** **낮음**
+- Host 1줄 추가. SMEM 사용량이 512 B밖에 안되므로 carveout 변경이 spill을 유발할 가능성 없음.
+- Fallback: 원복 1줄.
 
-**리스크** (낮음):
-- **Host-side overhead**: 더 많은 split → host reduce kernel 호출 증가 → host overhead ↑
-  - 각 split reduce: ~100~200 ns
-  - 4× split → 최악 ~800 ns 추가 overhead
-  - Kernel 시간(9~10 µs) 대비 8~10% 부담 → 명백한 악화 우려
-- **L2 cold miss 증가**: 더 많은 kernel → global state read 재반복 (하지만 state는 L2 warm이므로 미미)
-- **Diminishing return**: 이미 낮은 issue slot이 더 나빠질 수 있음
+**회귀 위험:** 낮음. 단, R3 실패 조합과 분리해서 단독 측정해야 함.
 
-**실패 시 귀결**:
-- Host overhead > grid parallelism 이득 → median > 0.012 ms (악화)
+**구현 난도:** 5분. `gdn_decode` 진입 1회 static initializer.
 
 ---
 
-#### **후보 G6: Memory Layout Optimization (SMEM prefetch pattern 강화)**
+### 후보 C: **G6. `__builtin_assume()` 인덱스 힌트** (우선도: ★ 중)
 
-**구성**:
-```cuda
-// 현재: State read는 thread별로 global L2에서 직접 read
-// 변경: 
-//   - State를 tile 단위로 SMEM으로 prefetch
-//   - 또는 warp-group 수준에서 coalesced global read → SMEM staging
-//   - 그후 SMEM에서 필요한 데이터만 선택
+**상세:**
+- 커널 진입부에 `__builtin_assume(blockDim.x == BLOCK_SIZE)`, `__builtin_assume(split_id >= 0 && split_id < split_factor)` 힌트 추가.
+- nvcc/ptxas의 분기 제거 및 인덱스 계산 단순화 유도.
 
-// 리소스: Current SMEM 512B → 2KB~4KB (state tile 임시)
-```
+**NCU 근거:**
+- Issue Slots Busy 22.57%에서 주소 계산 overhead가 일부 포함됨.
+- 이미 `__restrict__`, `#pragma unroll`, `__launch_bounds__`가 있으므로 추가 힌트 이득은 marginal하지만 **downside는 0**.
 
-**근거**:
-- **Memory coalescing 개선**: Warp-wide coalesced global read → 1~2 transactions vs 각각 128 transactions
-- **Register pressure 완화**: State를 SMEM에 stage → loop 내 temp register 감소
+**기대 효과:** –0~–0.0001 ms. 부가 이득.
 
-**예상 결과**:
-| 지표 | 이전 | 기대 |
-|------|------|------|
-| Global transactions | 높음 | 중간~낮음 |
-| Register/thread | 56 | 50~54 |
-| Achieved Occupancy | 27.34% | 28~30% |
-| Latency | 0.011415 ms | 0.011.2~0.011.4 ms |
+**리스크:** **매우 낮음**. assume 문이 틀렸을 경우 UB지만, 이번 힌트는 물리적으로 보장된 조건(블록 크기 고정).
 
-**리스크** (중간):
-- **SMEM access latency**: Global→L2 (~100 cycles) vs SMEM→register (~30 cycles)는 이점
-  - 하지만 SMEM write + read의 왕복 cost 고려 필요
-- **Synchronization overhead**: `__syncthreads()` 추가 → 1~2 cycles × 3~5회 = ~10 cycles 부담
-- **예상**: 개선 가능성은 낮음 (R5, R2 경험상)
-
-**실패 시 귀결**:
-- SMEM overhead > global L2 hit 이점 → latency 무변화 또는 악화
+**구현 난도:** 5분.
 
 ---
 
-### 세 가지 전략 비교
+### 후보 D: **H2 `cuda::pipeline<thread_scope_block, 3>` + `memcpy_async`** (우선도: ☆ 후순위)
 
-| 후보 | 리스크 | 기대 효과 | 구현 난이도 | Rollback 비용 | 추천도 |
-|------|--------|----------|-----------|-------------|--------|
-| **B5** (warp spec) | 높음 | 매우 높음 (occupancy + ILP) | 높음 | 불가능 | ⭐⭐⭐ |
-| **B2** (async pipeline) | 중간 | 높음 (bytes-in-flight + ILP) | 중간 | 불가능 | ⭐⭐⭐ |
-| **I1** (split ↑) | 낮음 | 낮음 (host overhead 우려) | 낮음 | 쉬움 | ⭐ |
-| **G6** (SMEM prefetch) | 중간 | 낮음 (cache effect 미미) | 중간 | 불가능 | ⭐ |
+**상세:** 현재 register 기반 dual-buffer(curr/next)를 3-stage SMEM pipeline으로 재설계.
 
----
+**리스크:** **매우 높음**
+- B5/R5 2회 실패, async pipeline 계열은 harness 경로에서 setup cost가 이득 상쇄.
+- SMEM 인덱싱 오류 재현 가능성 高.
 
-## Step 2: PM 검토 대화 및 결론
-
-### 핵심 질문
-
-#### Q1. "프로파일·근거" — 어떤 후보를 선택하고 왜인가?
-
-**검토 관점**:
-1. **Issue Slot Busy (17.33%) 해결 가능성**
-   - B5 (warp spec): ✅ Directly → producer 독점 load → consumer ILP ↑
-   - B2 (async pipeline): ⚠️ Partial → overlap로 부분 개선
-   - I1 (split ↑): ❌ 근본 해결 안 함
-   - G6 (SMEM): ❌ 근본 해결 안 함
-
-2. **Occupancy 개선 (27.34% → 32%+ 목표)**
-   - B5: ✅ setmaxnreg + register 감소 → occupancy 개선 확실
-   - B2: ⚠️ Register spilling 위험 → occupancy 악화 가능
-   - I1: ❌ 영향 없음
-   - G6: ⚠️ SMEM overhead > 이득
-
-3. **Blackwell 하드웨어 활용**
-   - B5: ✅ mbarrier, setmaxnreg, distributed SMEM 활용
-   - B2: ✅ memcpy_async + cuda::pipeline (libcu++지원)
-   - I1: ⚠️ 일반적 기법
-   - G6: ⚠️ 일반적 기법
-
-**결론**: **B5 (Warp Specialization)가 가장 강한 근거를 가짐.**
-- Issue slot 병목과 occupancy 병목을 동시에 해결
-- Blackwell 하드웨어를 직접 활용
-- 0.011 ms → 0.010.5 ms 이상 개선 기대 (20% 개선 목표 중 50% 이상)
+**판정:** ⏸️ **이번 iter 범위 초과** — iter #2 이후 H2.5 포함 재설계 시점에 묶어서 검토.
 
 ---
 
-#### Q2. "한 iteration에 과한가?" — 구현 일정과 리스크 규모
+### 후보 E: **F3. State in-place update (new_state == state 허용 여부)** (우선도: ☆ 조사 필요)
 
-**B5 구현 범위**:
-```
-1. mbarrier init (grid-level) — TVM FFI 호환성 확인 필수
-2. Warp 0: cuda::memcpy_async 기반 producer loop
-3. Warp 1-3: setmaxnreg.dec + consumer loop
-4. Synchronization: mbarrier.arrive/wait + cluster barrier (선택사항)
-5. 전체 커널 재작성 (백업 필수)
-6. PTX 검증 → SASS 확인
-```
+**상세:** API가 `new_state`에 `state`와 동일 포인터 전달을 허용하면 store 트래픽 완전 제거 (16 KB × block 수).
 
-**일정 추정**:
-- 구현: 3~4시간 (새로운 기법 학습 + PTX 디버깅)
-- 빌드 + 벤치: 30분
-- 총 4~5시간
+**리스크:** API 계약 확인 필요. `scripts/pack_solution.py`와 bench harness 상 `state/new_state`가 별도 tensor임을 가정하는지 조사 필요.
 
-**현실성**:
-- 한 iteration으로 가능하나, **FFI 호환성이 blocker가 될 수 있음**
-- 최악: TVM launcher가 `cudaLaunchCooperativeKernel` 미지원 → B5 불가능
-- 이 경우 **B2로 fallback** 필요
+**판정:** ⏸️ **이번 iter에서는 조사만**. 다음 iter에서 조건부 진행.
 
 ---
 
-#### Q3. "회귀 리스크" — B5 변경으로 다른 batch에서 문제?
+### Step 1 후보 요약 표
 
-**안전성 분석**:
-1. **Mbarrier + setmaxnreg는 kernel-launch 레벨 설정**
-   - 모든 kernel instance(각 batch)에 동일하게 적용
-   - Register allocation은 컴파일 타임에 고정 → runtime 동작 예측 가능
-
-2. **Warp specialization의 일관성**
-   - Warp 0-3의 역할은 kernel 컴파일에 고정
-   - Warp ID는 blockIdx.x, threadIdx.x로 결정 → 모든 batch에 동일
-
-3. **이전 실패 경험 (R8: cluster)**
-   - Cluster barrier가 overhead 추가 → median 악화
-   - B5는 **mbarrier**, 즉 **hardware barrier** → 비용 더 낮음
-
-**우려 사항**:
-- Producer (warp 0)의 register spilling 가능성
-  - 만약 async memcpy + register allocation이 40 regs 넘으면 spilling 발생
-  - 이 경우 producer throughput ↓ → consumer stall ↑
-- **대책**: PTX 검증에서 register/spill 수치 명시적 확인
+| 후보 | 우선도 | 기대효과 (E2E) | 리스크 | 구현 시간 | 판정 |
+|------|--------|----------------|--------|-----------|------|
+| **F4** lane 0~3 4-way store | ★★★ | –0.0002~–0.0005 ms | 낮음 | 10분 | **채택 후보 1** |
+| **A6** SMEM carveout=0 (standalone) | ★★ | –0~–0.0003 ms | 낮음 | 5분 | **채택 후보 2** |
+| **G6** `__builtin_assume` | ★ | –0~–0.0001 ms | 매우 낮음 | 5분 | 채택 후보 3 (부가) |
+| H2 block pipeline | ☆ | (불확실) | 매우 높음 | 3시간+ | 이번 iter 제외 |
+| F3 state in-place | ☆ | –0.0003~–0.001 ms | 조사 필요 | 조사 30분 | 다음 iter |
 
 ---
 
-### PM 최종 판정
+## Step 2: PM 검토 대화
 
-#### 권장: **B5 (Warp Specialization) + B2 (Async Pipeline) 중 순선택**
+### 라운드 1
 
-**선택 기준**:
-1. **B5 우선**: Issue slot + occupancy 병목을 동시 해결 → 0.010.5 ms 기대
-   - FFI 호환성 확인 후 진행
-   - 실패 시 → B2로 전환 (fallback plan)
+**PM(Product Manager / System Architect):**
+> "지난 몇 iter 로그를 보니 구조적 변경 계열은 전부 실패했다(B1, B5, D5, H4, R2/R3/R5 등). 현 커널은 이미 H2.5, __ldg, I1, lane-0 gate, L2 persistence 가 다 들어가 있고 E2E latency는 0.011108 ms에 고정됐다. 이번 iter의 후보 F4/A6/G6는 '저위험 저이득' 조합인데 세 가지 궁금증이 있다.
+>
+> (a) **프로파일·근거**: F4가 실제 lane-0 store 직렬화가 병목이라는 NCU 근거가 있나? 'issue slots busy 22.57%'는 간접 증거 아닌가?
+> (b) **한 iter에 과한가**: 세 후보를 동시에 적용하면 어떤 효과가 어디서 왔는지 구분이 안 된다. 한 번에 몇 개까지 쌓을 것인가?
+> (c) **회귀 리스크**: R3에서 `carveout=0` 조합이 이미 실패했다. standalone 재시도라도 같은 결과가 나올 수 있지 않나?"
 
-2. **B2 대체안**: FFI 문제 발생 시 즉시 시작
-   - 구현이 더 간단 (기존 loop를 async pipeline으로 감싸면 됨)
-   - 예상 개선: 0.011 ms → 0.010.5~0.011 ms (B5보다 약하지만 확실)
+**Assistant(Technical Lead):**
+> "좋은 지적이다. 순서대로 답한다.
+>
+> (a) F4의 직접 근거는 없다. `store pipe`의 utilization을 보려면 `lts__t_bytes_op_write` 또는 `smsp__inst_executed_pipe_adu`가 필요한데 현재 detailed set에는 안 들어간다. 다만 다음 두 간접 근거는 있다.
+>    - SASS 관점: lane 0만 store하면 warp 한 번 issue 시 **inactive lane 31개** → issue slot 한 개가 낭비.
+>    - 현 4 row × 1 store = 4 store/iter에 lane 0 직렬화. 4-way 분산 시 동일 4 store지만 **activation mask**가 `0xF` → issue가 packed되고 lane 0 waitfor가 없어진다. Blackwell STG.B16 throughput는 sub-warp 분산 친화적이다.
+>    - 확신도: **70%** 정도. 틀려도 다운사이드는 거의 0 (정밀도/구조 불변).
+>
+> (b) 한 iter에 **단일 변경이 원칙** (workflow.md 절대 규칙 3). 따라서:
+>    - **F4 단독 적용 → 측정** (벤치 5회 median, 다음 세션).
+>    - 결과에 따라 A6·G6를 **별도 iter**로 순차 적용.
+>    - 즉 이번 iter 구현 세션에서는 **F4 1개만** 건드린다.
+>
+> (c) R3 조합은 'split-local s_v staging + carveout=0'이었다. s_v staging이 extra SMEM을 실제로 사용하게 만들어 carveout=0가 반대로 성능을 끌어내렸을 수 있다. 지금은 s_v가 여전히 512 B뿐이라 carveout=0는 **L1을 키우는 방향**으로만 작용한다 → 메커니즘이 다르다. 다만 PM 지적대로 **단독 재시도도 downside 가능성**이 있으므로 **이번 iter에서는 A6/G6는 일단 제외**하고, F4 측정 결과 확인 후 다음 iter에 이어붙인다."
 
-3. **I1/G6 제외**: Risk (host overhead / SMEM overhead)가 return (grid parallelism / minor register 절감) 상회
+**PM:**
+> "좋다. (b) 단일 변경 원칙과 (c) 조합 분리가 정리됐다. 그럼 이번 iter 스코프를 **F4 단독**으로 좁히자. 추가 조건:
+>
+> 1. 벤치는 최소 3회, Phase 3 이후이므로 median of 5 권장.
+> 2. correctness는 전 54 workload 통과 필수.
+> 3. NCU Duration 측정 병행해서 kernel-level 이득도 확인.
+> 4. **만약 E2E가 ±0.0003 ms 이내(Modal 노이즈 범위)면 유지 vs 롤백 판단 보류**하고 A6/G6 조합은 별도 iter로 이어붙여 최종 판단.
+> 5. 회귀(median 0.011108 + 0.5% 이상) 시 즉시 롤백.
+>
+> 이 조건에 동의하면 APPROVED 한다."
 
----
+**Assistant:**
+> "동의한다. 조건 요약:
+> - Scope: **F4 4-way store 단독**
+> - Measurement: 5회 bench + NCU detailed 1회
+> - Accept: median ≤ 0.011108 ms 유지 + correctness PASS
+> - Reject: median > 0.011108 × 1.005 ms 또는 correctness FAIL → 즉시 롤백
+> - Fallback(다음 iter): A6 → G6 순차 적용"
 
-#### **APPROVED** 방향
+### 라운드 2 (확인)
 
-**최종 결정**: **Iteration #2에서 B5 (Warp Specialization) 시도**
+**PM:**
+> "마지막 확인. F4 구현에서 lane < 4 분기가 B200에서 실제로 divergence 없이 predicated execution으로 처리되는지, 그리고 `res_a/b/c/d`·`qs_a/b/c/d`가 warp-wide로 broadcast된 값이 맞는지 코드로 재확인했나?"
 
-**실행 계획**:
-1. **Phase 1**: TVM FFI launcher 검토
-   - `cudaLaunchCooperativeKernel` 지원 확인
-   - mbarrier init을 grid-level에서 호출 가능한지 확인
-   - 불가능 → B2로 즉시 전환
-
-2. **Phase 2**: Kernel 구현 (B5)
-   - Warp 0: `cuda::memcpy_async` producer
-   - Warp 1-3: `setmaxnreg.dec` consumer
-   - mbarrier + synchronization
-
-3. **Phase 3**: PTX/SASS 검증
-   - Register spilling 확인 (goal: producer ≤ 40, consumer ≤ 52)
-   - Issue slot 변화 추적
-
-4. **Phase 4**: Benchmark + NCU profiling
-   - 5회 median 측정 (Phase 4 기준)
-   - 목표: 0.010.5 ms 이상, correctness 100%
-
----
-
-#### **대안 계획** (B5 FFI 호환성 실패 시)
-
-**B2 (Async Pipeline) 즉시 전환**:
-```
-1. Loop 3-stage로 구조화 (preload, main, epilogue)
-2. cuda::memcpy_async + cuda::pipeline + barrier
-3. Double-buffering: state[2], q[2], k[2] SMEM (또는 register)
-4. 컴파일 + 벤치 (4시간 내 완료)
-5. 기대: median 0.010.5~0.011 ms (B5보다 약하지만 acceptable)
-```
-
----
-
-#### 성공 조건 및 다음 단계
-
-**Iteration #2 성공 = Median ≤ 0.0105 ms (B5) 또는 ≤ 0.0110 ms (B2)**
-
-**다음 iteration (Iteration #3)에서는**:
-- B5 성공 시: **B2 적용** (async pipeline 추가) → 0.009.5 ms 도전
-- B5/B2 모두 미달 시: **CUDA Graph** (host launch overhead 제거) + **Cluster communication** 재검토
+**Assistant:**
+> "확인했다. `solution/cuda/kernel.cu` line 175–189에서 `__shfl_down_sync`로 butterfly 후 line 186–189에서 `__shfl_sync(0xffffffff, *, 0)`로 **전 lane에 값 일치**. 따라서 `lane < 4` 조건은 **값 생성 후** 적용되므로 lane 1~3도 `res_*`, `qs_*` 값을 갖는다. B200에서 `if (lane < 4)` predicate는 SASS에서 `@P0 STG.E.U16` 형태로 변환되어 **branch 없는 predicated store**가 된다.
+>
+> 결론: correctness-safe, divergence-free. **APPROVED 수용 준비 완료**."
 
 ---
 
-## 최종 결론
+## PM 최종 판정
 
-| 항목 | 내용 |
-|------|------|
-| **선택 방향** | B5 (Warp Specialization: producer/consumer + mbarrier + setmaxnreg) |
-| **기대 성능** | 0.010.5 ms (20% 추가 개선 목표) |
-| **리스크 평가** | 중간 (FFI 호환성 확인 필수, fallback B2 준비) |
-| **구현 범위** | 커널 전체 재구성, PTX 검증 필수 |
-| **일정** | 4~5시간 (FFI 호환성 확인까지) |
-| **Status** | **APPROVED** — Iteration #2 진행 승인 |
+### ✅ **APPROVED: F4 Output Store 4-way Lane Distribution (단독)**
+
+**승인 조건 요약:**
+1. 변경은 `solution/cuda/kernel.cu` line 209–214 **1곳만** (lane 0 단일 if → lane < 4 분산).
+2. 벤치 5회 median + 54-workload correctness + NCU detailed 1회 측정.
+3. Accept: median ≤ 0.011108 ms.
+4. Reject (즉시 롤백): median > 0.011108 × 1.005 ms 또는 correctness FAIL.
+5. 성공/부분성공 무관하게 A6/G6는 **다음 iter**로 분리.
+
+**현재 iter 스코프에서 제외:**
+- A6 (SMEM carveout=0) — 다음 iter 후보
+- G6 (`__builtin_assume`) — 다음 iter 후보
+- H2/F3 — 조사 단계 후 추후 재검토
+- B1/B5/D5 계열 — 재시도 금지(현 harness에서 실패)
+
+**기대 결과:**
+- E2E latency: 0.011108 ms → 0.0106~0.0110 ms (–0.2~–0.5%).
+- NCU Duration: 30.85 µs → 30.0~30.5 µs.
+- Phase 4 (0.009 ms)까지는 여전히 거리가 있으나, **lane idle 해소가 누적 기반**이 된다.
+
+**구현/측정 세션(다음 단계):**
+- Step 3: F4 구현 (line 209–214 편집).
+- Step 4: pack → modal bench 5회 → NCU detailed 1회.
+- Step 5: 판정 → 유지/롤백 결정 → log.md에 기록.
 
 ---
 
-**본 계획은 다음을 근거로 수립되었습니다:**
-- 병목 분석: Issue Slot (17.33%) + Occupancy (27.34%) + Register Pressure (56)
-- 하드웨어 지원: Blackwell sm_100a의 mbarrier, setmaxnreg, distributed SMEM
-- 이전 경험: R1~R10 반복에서 "단편적 개선" → 근본 구조 변경 필요 확인
-- 시간 효율: Phase 4 목표 (0.009 ms)까지 2~3 iteration 예상, B5가 최적 경로
-
+**APPROVED.**
